@@ -8,8 +8,15 @@ from fastapi import HTTPException
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from app.api.chat import download_harness_artifact
-from app.core.harness_session_cleanup import harness_task_workspace_path
+from app.api.chat import (
+    download_harness_artifact,
+    download_session_workspace_file,
+    list_session_workspace_files,
+)
+from app.core.harness_session_cleanup import (
+    harness_session_workspace_path,
+    harness_task_workspace_path,
+)
 from app.db.models import (
     ChatSession,
     HarnessTaskFrameRecord,
@@ -24,6 +31,13 @@ from app.harness import (
     publish_changed_harness_artifacts,
     publish_harness_artifacts,
     snapshot_harness_workspace,
+)
+from app.harness.workspace_files import (
+    WORKSPACE_FILE_KIND_DELIVERABLE,
+    WORKSPACE_FILE_KIND_DERIVED,
+    WORKSPACE_FILE_KIND_SOURCE,
+    WORKSPACE_FILE_VISIBILITY_SESSION,
+    create_workspace_file_ref,
 )
 
 
@@ -147,6 +161,137 @@ def test_downloads_only_a_published_file_from_the_exact_frame(
         )
         assert response.headers["x-content-type-options"] == "nosniff"
         assert response.headers["etag"] == f'"sha256:{published[0]["sha256"]}"'
+
+
+def test_session_file_area_hides_derived_data_and_downloads_immutable_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        user = _seed_artifact(db)
+        workspace = harness_task_workspace_path(
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+            task_frame_id="task_demo",
+        )
+        session_workspace = harness_session_workspace_path(
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+        )
+        source_path = workspace / "input" / "attachments" / "作业票.pdf"
+        source_path.parent.mkdir(parents=True)
+        source_path.write_bytes(b"%PDF-example")
+        source = create_workspace_file_ref(
+            db,
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+            task_frame_id="task_demo",
+            workspace_root=workspace,
+            source_path="input/attachments/作业票.pdf",
+            logical_path="作业票.pdf",
+            kind=WORKSPACE_FILE_KIND_SOURCE,
+            visibility=WORKSPACE_FILE_VISIBILITY_SESSION,
+            archive_workspace_root=session_workspace,
+        )
+        derived_path = workspace / "input" / "attachments" / "作业票.pdf.extracted.txt"
+        derived_path.write_text("提取文本", encoding="utf-8")
+        create_workspace_file_ref(
+            db,
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+            task_frame_id="task_demo",
+            workspace_root=workspace,
+            source_path="input/attachments/作业票.pdf.extracted.txt",
+            logical_path="作业票.pdf.extracted.txt",
+            kind=WORKSPACE_FILE_KIND_DERIVED,
+            visibility=WORKSPACE_FILE_VISIBILITY_SESSION,
+            archive_workspace_root=session_workspace,
+        )
+        output_path = workspace / "output" / "report.md"
+        output_path.parent.mkdir(parents=True)
+        output_path.write_text("first version", encoding="utf-8")
+        create_workspace_file_ref(
+            db,
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+            task_frame_id="task_demo",
+            workspace_root=workspace,
+            source_path="output/report.md",
+            logical_path="report.md",
+            kind=WORKSPACE_FILE_KIND_DELIVERABLE,
+            visibility=WORKSPACE_FILE_VISIBILITY_SESSION,
+            archive_workspace_root=session_workspace,
+        )
+        output_path.write_text("latest version", encoding="utf-8")
+        deliverable = create_workspace_file_ref(
+            db,
+            tenant_id="tenant_demo",
+            session_id="session_demo",
+            task_frame_id="task_demo",
+            workspace_root=workspace,
+            source_path="output/report.md",
+            logical_path="report.md",
+            kind=WORKSPACE_FILE_KIND_DELIVERABLE,
+            visibility=WORKSPACE_FILE_VISIBILITY_SESSION,
+            archive_workspace_root=session_workspace,
+        )
+        assistant = db.get(Message, "msg_assistant")
+        assert assistant is not None
+        assistant.metadata_json = {
+            "harness_artifacts": [
+                {
+                    "type": "workspace_file",
+                    "task_frame_id": "task_demo",
+                    "path": "output/report.md",
+                    "display_name": "最终分析报告.md",
+                    "workspace_file_ref": deliverable.model_payload(),
+                }
+            ]
+        }
+        db.add(assistant)
+        db.commit()
+
+        files = list_session_workspace_files(
+            "session_demo",
+            tenant_id="tenant_demo",
+            current_user=user,
+            db=db,
+        )
+        assert [(item.filename, item.category) for item in files] == [
+            ("最终分析报告.md", "generated"),
+            ("作业票.pdf", "upload"),
+        ]
+        downloaded = download_session_workspace_file(
+            "session_demo",
+            deliverable.id,
+            tenant_id="tenant_demo",
+            current_user=user,
+            db=db,
+        )
+        assert downloaded.headers["content-length"] == str(len(b"latest version"))
+        assert downloaded.headers["etag"] == f'"sha256:{deliverable.sha256}"'
+        source_download = download_session_workspace_file(
+            "session_demo",
+            source.id,
+            tenant_id="tenant_demo",
+            current_user=user,
+            db=db,
+        )
+        assert source_download.headers["content-length"] == str(len(b"%PDF-example"))
+
+        output_path.unlink()
+        artifact_download = download_harness_artifact(
+            "session_demo",
+            "task_demo",
+            tenant_id="tenant_demo",
+            path="output/report.md",
+            current_user=user,
+            db=db,
+        )
+        assert artifact_download.headers["content-length"] == str(len(b"latest version"))
+        assert artifact_download.headers["etag"] == f'"sha256:{deliverable.sha256}"'
 
 
 def test_publisher_builds_relative_hashed_metadata(tmp_path: Path) -> None:

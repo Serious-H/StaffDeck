@@ -12,6 +12,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.agents.branching import ensure_open_gallery_binding
+from app.capabilities.local_general_skill import package_from_row
 from app.core import harness_agent as harness_agent_module
 from app.core import turn_planner as turn_planner_module
 from app.core.agent_loop import AgentLoop
@@ -35,6 +36,7 @@ from app.core.harness_session_cleanup import harness_task_workspace_path
 from app.core.harness_v2_engine import (
     HarnessV2Engine,
     _globalize_citations,
+    _materialize_dependency_workspace_files,
     _prior_result,
     _turn_skill_projection,
     _with_recoverable_first_session,
@@ -61,6 +63,7 @@ from app.db.models import (
     HarnessRunRecord,
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
+    HarnessWorkspaceFileRecord,
     Message,
     ModelConfig,
     ScheduledTask,
@@ -77,6 +80,7 @@ from app.scheduled_tasks.service import (
     _finish_task_schedule,
     _scheduled_harness_outcome,
 )
+from app.session.attachment_store import stage_chat_attachment
 from app.session.session_schema import (
     ChatAttachmentRead,
     ChatTurnRequest,
@@ -85,7 +89,6 @@ from app.session.session_schema import (
     SessionPublic,
     TurnPlan,
 )
-from app.session.attachment_store import stage_chat_attachment
 from app.skills.skill_schema import SkillCapabilityRefs
 from app.tools.tool_schema import ToolResult
 
@@ -890,7 +893,7 @@ def test_attachments_are_materialized_inside_only_the_task_workspace(
 
     assert descriptors[0]["materialized"] is True
     sandbox_path = str(descriptors[0]["workspace_path"])
-    assert sandbox_path.startswith("/workspace/attachments/")
+    assert sandbox_path.startswith("/workspace/input/attachments/")
     assert ".." not in sandbox_path
     relative_path = sandbox_path.removeprefix("/workspace/")
     assert (workspace / relative_path).read_text(encoding="utf-8") == "evidence"
@@ -935,10 +938,56 @@ def test_staged_image_is_both_a_sandbox_file_and_vision_payload(
     assert descriptors[0]["materialized"] is True
     assert descriptors[0]["vision_available"] is True
     sandbox_path = str(descriptors[0]["workspace_path"])
-    assert sandbox_path.startswith("/workspace/attachments/")
+    assert sandbox_path.startswith("/workspace/input/attachments/")
     assert (workspace / sandbox_path.removeprefix("/workspace/")).read_bytes() == raw
     assert len(payloads) == 1
     assert payloads[0].data_url == attachment.data_url
+
+
+def test_materialized_pdf_and_extracted_text_are_registered_as_session_files(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    raw = b"%PDF-1.7\nexample\n"
+    parsed = ChatAttachmentRead(
+        id="ticket-pdf",
+        filename="作业票.pdf",
+        content_type="application/pdf",
+        size=len(raw),
+        kind="pdf",
+        text="作业票提取文本",
+    )
+    attachment = stage_chat_attachment(
+        parsed,
+        raw,
+        tenant_id="tenant-demo",
+        user_id="user-demo",
+    )
+    engine = _test_engine()
+    with Session(engine) as db:
+        descriptors = materialize_task_attachments(
+            [attachment],
+            tenant_id="tenant-demo",
+            user_id="user-demo",
+            session_id="session-demo",
+            task_frame_id="task-pdf",
+            db=db,
+        )
+        records = db.exec(
+            select(HarnessWorkspaceFileRecord).where(
+                HarnessWorkspaceFileRecord.session_id == "session-demo"
+            )
+        ).all()
+
+    assert descriptors[0]["workspace_path"].startswith("/workspace/input/")
+    assert descriptors[0]["workspace_file_ref"]["file_kind"] == "source"
+    assert descriptors[0]["extracted_text_path"].startswith("/workspace/input/")
+    assert descriptors[0]["extracted_text_file_ref"]["file_kind"] == "derived"
+    assert {(record.logical_path, record.kind, record.visibility) for record in records} == {
+        ("作业票.pdf", "source", "session"),
+        ("作业票.pdf.extracted.txt", "derived", "session"),
+    }
 
 
 def test_capability_manifest_only_exposes_current_step_sop_specific_resources() -> None:
@@ -1421,32 +1470,126 @@ def test_file_mutation_is_private_until_publish_artifact_succeeds(
 
         written = invoker.invoke(
             "write_file",
-            {"path": "reports/result.txt", "content": "ready", "create_parents": True},
+            {
+                "path": "output/reports/result.txt",
+                "content": "ready",
+                "create_parents": True,
+            },
         )
         published = invoker.invoke(
             "publish_artifact",
-            {"path": "reports/result.txt", "display_name": "结果.txt"},
+            {"path": "output/reports/result.txt", "display_name": "结果.txt"},
         )
 
     assert written["success"] is True
     assert written["artifacts"] == []
     assert written["data"]["published"] is False
     assert published["success"] is True
-    assert published["artifacts"] == [
-        {
-            "type": "workspace_file",
-            "task_frame_id": "task-artifact",
-            "path": "reports/result.txt",
-            "sandbox_path": "/workspace/reports/result.txt",
-            "sha256": published["data"]["sha256"],
-            "size": 5,
-            "display_name": "结果.txt",
-            "description": None,
-            "content_type": "text/plain",
-            "operation": "publish_artifact",
-            "source": "harness",
-        }
-    ]
+    assert len(published["artifacts"]) == 1
+    artifact = published["artifacts"][0]
+    assert artifact["path"] == "output/reports/result.txt"
+    assert artifact["sandbox_path"] == "/workspace/output/reports/result.txt"
+    assert artifact["workspace_file_ref"]["file_kind"] == "deliverable"
+    assert artifact["workspace_file_ref"]["visibility"] == "session"
+
+
+def test_later_taskframe_materializes_a_session_file_ref_into_its_input(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    session = _chat_session()
+    with Session(engine) as db:
+        manifest = CapabilityManifestBuilder(db).build("tenant-demo", None, None, None)
+        producer = HarnessCapabilityInvoker(
+            db,
+            tenant_id="tenant-demo",
+            session=session,
+            task_frame_id="task-producer",
+            model_config=_model_config(),
+            manifest=manifest,
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+        )
+        assert producer.invoke(
+            "write_file",
+            {
+                "path": "output/alarm-summary.json",
+                "content": '{"total": 3}',
+            },
+        )["success"] is True
+        published = producer.invoke(
+            "publish_artifact",
+            {"path": "output/alarm-summary.json"},
+        )
+        ref_id = published["artifacts"][0]["workspace_file_ref"]["ref_id"]
+
+        consumer = HarnessCapabilityInvoker(
+            db,
+            tenant_id="tenant-demo",
+            session=session,
+            task_frame_id="task-consumer",
+            model_config=_model_config(),
+            manifest=manifest,
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+        )
+        materialized = consumer.invoke(
+            "workspace_file_materialize",
+            {"ref_id": ref_id},
+        )
+        read_back = consumer.invoke(
+            "read_file",
+            {"path": materialized["data"]["sandbox_path"]},
+        )
+
+    assert materialized["success"] is True
+    assert materialized["data"]["sandbox_path"].startswith("/workspace/input/session/")
+    assert read_back["success"] is True
+    assert read_back["data"]["content"] == '{"total": 3}'
+
+
+def test_dependent_taskframe_receives_prior_declared_output_as_input(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    session = _chat_session()
+    with Session(engine) as db:
+        manifest = CapabilityManifestBuilder(db).build("tenant-demo", None, None, None)
+        producer = HarnessCapabilityInvoker(
+            db,
+            tenant_id="tenant-demo",
+            session=session,
+            task_frame_id="task-producer",
+            model_config=_model_config(),
+            manifest=manifest,
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+        )
+        assert producer.invoke(
+            "write_file",
+            {"path": "output/alarms.json", "content": "[]"},
+        )["success"] is True
+        published = producer.invoke("publish_artifact", {"path": "output/alarms.json"})
+        dependency_files = _materialize_dependency_workspace_files(
+            db,
+            tenant_id="tenant-demo",
+            session_id=session.id,
+            task_frame_id="task-consumer",
+            prior_frame_results=[{"artifacts": published["artifacts"]}],
+        )
+
+    assert len(dependency_files) == 1
+    assert dependency_files[0]["materialized"] is True
+    assert dependency_files[0]["sandbox_path"].startswith(
+        "/workspace/input/dependencies/"
+    )
 
 
 def test_workspace_discovery_returns_source_and_generated_image(
@@ -1471,22 +1614,17 @@ def test_workspace_discovery_returns_source_and_generated_image(
         written = invoker.invoke(
             "write_file",
             {
-                "path": "/workspace/generate_chart.py",
+                "path": "/workspace/work/generate_chart.py",
                 "content": "print('chart')\n",
             },
         )
-        (invoker.workspace_root / "chart.png").write_bytes(b"png")
+        (invoker.workspace_root / "output" / "chart.png").write_bytes(b"png")
         artifacts = invoker.discover_artifacts()
 
-    assert written["data"]["path"] == "/workspace/generate_chart.py"
-    assert {item["path"] for item in artifacts} == {
-        "chart.png",
-        "generate_chart.py",
-    }
-    assert {item["sandbox_path"] for item in artifacts} == {
-        "/workspace/chart.png",
-        "/workspace/generate_chart.py",
-    }
+    assert written["data"]["path"] == "/workspace/work/generate_chart.py"
+    assert [item["path"] for item in artifacts] == ["output/chart.png"]
+    assert [item["sandbox_path"] for item in artifacts] == ["/workspace/output/chart.png"]
+    assert artifacts[0]["workspace_file_ref"]["path"] == "chart.png"
 
 
 def test_large_external_json_result_uses_sandbox_reference_and_auto_resolves(
@@ -1820,6 +1958,7 @@ def test_general_skill_harness_tool_reads_full_package_when_requested(
             {"path": "SKILL.md", "content": "# Runner"},
             {"path": "scripts/run.sh", "content": "echo ok"},
         ],
+        metadata_json={"skill_directories": ["references/empty"]},
         status="published",
     )
     descriptor = CapabilityDescriptor(
@@ -1858,7 +1997,18 @@ def test_general_skill_harness_tool_reads_full_package_when_requested(
         "scripts/run.sh",
     ]
     assert read_result["data"]["operation"] == "read"
-    assert "不会生成临时代码" in read_result["data"]["notice"]
+    assert "真实包文件已物化" in read_result["data"]["notice"]
+    assert "不会启动第二套 runner" in read_result["data"]["notice"]
+    package = package_from_row(skill)
+    package_workspace = read_result["data"]["package_workspace"]
+    assert package_workspace["relative_path"] == (
+        f".harness/skill_packages/runner--{package.digest.removeprefix('sha256:')[:12]}"
+    )
+    package_root = invoker.workspace_root / package_workspace["relative_path"]
+    assert (package_root / "SKILL.md").read_text(encoding="utf-8") == "# Runner"
+    assert (package_root / "scripts/run.sh").read_text(encoding="utf-8") == "echo ok"
+    assert (package_root / "references/empty").is_dir()
+    assert invoker.discover_artifacts() == []
 
 
 def test_general_skill_harness_tool_defaults_to_read_instead_of_generating_code(

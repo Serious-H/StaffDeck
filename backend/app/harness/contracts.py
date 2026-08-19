@@ -52,6 +52,9 @@ class HarnessToolContext:
     sandbox_enabled: bool = True
     sandbox_network_mode: Literal["all", "allowlist", "deny"] = "all"
     sandbox_allowed_domains: tuple[str, ...] = ()
+    # Direct/internal callers preserve the historical root-wide workspace
+    # behavior. Harness v2 TaskFrames opt in to the input/work/output policy.
+    enforce_task_workspace_layout: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.run_id, str) or not self.run_id.strip():

@@ -612,6 +612,15 @@ export type HarnessWorkspaceArtifact = {
   source?: string | null;
 };
 
+export type SessionWorkspaceFile = {
+  id: string;
+  filename: string;
+  category: 'upload' | 'generated';
+  size: number;
+  content_type: string;
+  created_at: string;
+};
+
 export type HarnessArtifact =
   | HarnessWorkspaceArtifact
   | {

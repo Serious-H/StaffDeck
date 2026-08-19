@@ -32,6 +32,7 @@ from app.harness.sandbox import (
     require_backend,
     resolve_srt,
 )
+from app.harness.workspace_layout import ensure_task_workspace_layout
 from app.security.managed_subprocess import ManagedProcess, ManagedProcessError
 
 _BASH_PATH = "/bin/bash"
@@ -276,6 +277,11 @@ def exec_command(
     else:
         _validate_command(validation_command)
     workspace = _prepare_workspace(context)
+    task_environment = (
+        _task_workspace_environment(workspace)
+        if context.enforce_task_workspace_layout
+        else {}
+    )
     backend = available_backend() if context.sandbox_enabled else "unsandboxed"
     # Keep the existing Bubblewrap seam patchable for unit tests and Linux
     # deployments where the executable is provisioned outside PATH lookup.
@@ -316,6 +322,7 @@ def exec_command(
                 network_mode=context.sandbox_network_mode,
                 allowed_domains=context.sandbox_allowed_domains,
                 sandbox_temp=sandbox_temp_path,
+                restrict_to_task_workspace_layout=context.enforce_task_workspace_layout,
             )
             argv = _srt_argv(settings_path=settings_path, command=command)
         else:
@@ -328,14 +335,18 @@ def exec_command(
                 backend=backend,
                 env=None,
                 network_mode=context.sandbox_network_mode,
+                restrict_to_task_workspace_layout=context.enforce_task_workspace_layout,
             )
         process_kwargs: dict[str, Any] = {
             "cwd": workspace,
             "timeout_seconds": args.timeout_seconds,
             "output_limit": output_limit,
         }
+        process_env = dict(task_environment)
         if sandbox_temp_path is not None:
-            process_kwargs["env"] = {"TMPDIR": str(sandbox_temp_path)}
+            process_env["TMPDIR"] = str(sandbox_temp_path)
+        if process_env:
+            process_kwargs["env"] = process_env
         process = _run_bounded_process(argv, **process_kwargs)
     finally:
         if settings_path is not None:
@@ -386,7 +397,7 @@ def register_command_tools(registry: HarnessRegistry) -> HarnessRegistry:
             "Run a bounded platform shell script, including multiple newline-separated "
             "statements, inside this TaskFrame workspace. "
             "Linux and macOS use Bash; Windows uses PowerShell. The selected OS "
-            "sandbox makes only this workspace writable and applies the tenant's "
+            "sandbox makes the TaskFrame workspace writable and applies the tenant's "
             "configured network policy. On Windows do not use Bash syntax (heredoc, "
             "python3, py -3, or bash chaining); use PowerShell statements. In a "
             "packaged Windows build, python/python3 resolve to the bundled runtime; "
@@ -542,6 +553,8 @@ def _as_exec_arguments(arguments: BaseModel) -> ExecCommandArguments:
 
 def _prepare_workspace(context: HarnessToolContext) -> Path:
     root = context.workspace_root
+    if context.enforce_task_workspace_layout:
+        root = ensure_task_workspace_layout(root).root
     try:
         root.mkdir(parents=True, exist_ok=True)
         if root.is_symlink():
@@ -565,6 +578,36 @@ def _prepare_workspace(context: HarnessToolContext) -> Path:
         )
     _reject_workspace_symlinks(resolved)
     return resolved
+
+
+def _task_workspace_environment(workspace: Path) -> dict[str, str]:
+    """Create private runtime directories below ``work`` for governed commands.
+
+    Command-based Skills may invoke programs such as Git that create profile or
+    temporary files implicitly.  Keep those implementation details in ``work``
+    rather than granting write access to the TaskFrame root or ``input``.
+    """
+
+    layout = ensure_task_workspace_layout(workspace)
+    directories: dict[str, Path] = {
+        "HOME": layout.work_dir / ".home",
+        "TMPDIR": layout.work_dir / ".tmp",
+    }
+    for directory in directories.values():
+        try:
+            directory.mkdir(mode=0o700, exist_ok=True)
+        except OSError as exc:
+            raise HarnessExecutionError(
+                "INVALID_WORKSPACE",
+                "无法创建 TaskFrame 命令运行目录。",
+                details={"exception_type": type(exc).__name__},
+            ) from exc
+        if directory.is_symlink() or not directory.is_dir():
+            raise HarnessExecutionError(
+                "INVALID_WORKSPACE",
+                "TaskFrame 命令运行目录不可用。",
+            )
+    return {key: str(path.resolve(strict=True)) for key, path in directories.items()}
 
 
 def _reject_workspace_symlinks(root: Path) -> None:
@@ -638,6 +681,7 @@ def _write_srt_settings(
     network_mode: str = "all",
     allowed_domains: tuple[str, ...] = (),
     sandbox_temp: Path | None = None,
+    restrict_to_task_workspace_layout: bool = False,
 ) -> Path:
     if network_mode not in {"all", "allowlist", "deny"}:
         raise HarnessExecutionError("SANDBOX_POLICY_INVALID", "Unknown sandbox network policy.")
@@ -690,7 +734,11 @@ def _write_srt_settings(
     runtime_root = _bundled_runtime_root()
     if runtime_root is not None:
         allow_read.append(str(runtime_root))
-    allow_write = ["."]
+    if restrict_to_task_workspace_layout:
+        layout = ensure_task_workspace_layout(workspace)
+        allow_write = [str(layout.work_dir), str(layout.output_dir)]
+    else:
+        allow_write = ["."]
     if sandbox_temp is not None:
         resolved_temp = str(sandbox_temp.resolve(strict=True))
         allow_read.append(resolved_temp)
@@ -810,6 +858,7 @@ def _bubblewrap_argv(
     extra_readonly_paths: Sequence[Path] = (),
     network_mode: str = "deny",
     sandbox_cwd: str = SANDBOX_WORKSPACE,
+    restrict_to_task_workspace_layout: bool = False,
 ) -> list[str]:
     if network_mode not in {"all", "allowlist", "deny"}:
         raise HarnessExecutionError("SANDBOX_POLICY_INVALID", "Unknown sandbox network policy.")
@@ -820,8 +869,13 @@ def _bubblewrap_argv(
                 "macOS Seatbelt does not support domain allowlists; "
                 "SRT is required for this policy.",
             )
-        # Deny by default, keep the task workspace writable, and permit only
-        # read access to the system runtime needed by basic shell commands.
+        # Deny by default and permit only read access to the system runtime
+        # needed by basic shell commands. Governed TaskFrames expose writable
+        # ``work`` and ``output`` subdirectories only.
+        writable_paths = [workspace]
+        if restrict_to_task_workspace_layout:
+            layout = ensure_task_workspace_layout(workspace)
+            writable_paths = [layout.work_dir, layout.output_dir]
         profile = (
             "(version 1) (deny default) "
             "(allow process*) (allow sysctl-read) "
@@ -829,9 +883,10 @@ def _bubblewrap_argv(
             f'(allow file-read* (subpath "/bin")) '
             f'(allow file-read* (subpath "/private/etc")) '
             f'(allow file-read* (subpath "{workspace}")) '
-            f'(allow file-write* (subpath "{workspace}")) '
             + ("(deny network*)" if network_mode == "deny" else "(allow network*)")
         )
+        for path in writable_paths:
+            profile += f' (allow file-write* (subpath "{path}"))'
         for raw_path in dict.fromkeys(str(path.resolve()) for path in extra_readonly_paths):
             path = Path(raw_path)
             if path.is_dir() and path != workspace and not path.is_relative_to(workspace):
@@ -876,6 +931,24 @@ def _bubblewrap_argv(
         path = Path(raw_path)
         if path.is_dir() and path != workspace and not path.is_relative_to(workspace):
             argv.extend(("--ro-bind", raw_path, raw_path))
+    workspace_binding = ["--bind", str(workspace), SANDBOX_WORKSPACE]
+    home_directory = SANDBOX_WORKSPACE
+    temp_directory = SANDBOX_WORKSPACE
+    if restrict_to_task_workspace_layout:
+        layout = ensure_task_workspace_layout(workspace)
+        workspace_binding = [
+            "--ro-bind",
+            str(workspace),
+            SANDBOX_WORKSPACE,
+            "--bind",
+            str(layout.work_dir),
+            f"{SANDBOX_WORKSPACE}/work",
+            "--bind",
+            str(layout.output_dir),
+            f"{SANDBOX_WORKSPACE}/output",
+        ]
+        home_directory = f"{SANDBOX_WORKSPACE}/work/.home"
+        temp_directory = f"{SANDBOX_WORKSPACE}/work/.tmp"
     argv.extend(
         (
             "--proc",
@@ -884,24 +957,22 @@ def _bubblewrap_argv(
             "/dev",
             "--dir",
             SANDBOX_WORKSPACE,
-            "--bind",
-            str(workspace),
-            SANDBOX_WORKSPACE,
+            *workspace_binding,
             # Bubblewrap's root is otherwise an anonymous tmpfs. Remount only
-            # that mount read-only; the nested workspace bind remains writable.
+            # that mount read-only; nested work/output binds remain writable.
             "--remount-ro",
             "/",
             "--chdir",
             sandbox_cwd,
             "--setenv",
             "HOME",
-            SANDBOX_WORKSPACE,
+            home_directory,
             "--setenv",
             "PWD",
             sandbox_cwd,
             "--setenv",
             "TMPDIR",
-            SANDBOX_WORKSPACE,
+            temp_directory,
             "--setenv",
             "PATH",
             _SANDBOX_PATH,

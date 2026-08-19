@@ -14,6 +14,7 @@ import IconEdit from '@/assets/icons/edit.svg?react';
 import IconChevronDown from '@/assets/icons/chevron-down.svg?react';
 import IconLogout from '@/assets/icons/logout.svg?react';
 import LanguageSwitcher from '@/components/LanguageSwitcher';
+import StaffdeckIcon from '@/components/StaffdeckIcon';
 
 import {
   CHAT_HEADER_CLASS,
@@ -22,7 +23,17 @@ import {
 } from '../chatPageStyles';
 import type { UseChatSession } from '../useChatSession';
 
-export default function ChatHeader({ chat }: { chat: UseChatSession }) {
+type ChatHeaderProps = {
+  chat: UseChatSession;
+  sessionFilesOpen?: boolean;
+  onToggleSessionFiles?: () => void;
+};
+
+export default function ChatHeader({
+  chat,
+  sessionFilesOpen = false,
+  onToggleSessionFiles,
+}: ChatHeaderProps) {
   const { auth, currentSession, openRename, logout } = chat;
   const teamId = currentSession?.team_id || null;
   const rawName = currentSession?.title
@@ -79,6 +90,18 @@ export default function ChatHeader({ chat }: { chat: UseChatSession }) {
       </div>
 
       <div className="flex shrink-0 items-center gap-[8px]">
+        <button
+          type="button"
+          aria-label="本会话文件"
+          aria-expanded={sessionFilesOpen}
+          disabled={!currentSession}
+          title={currentSession ? '本会话文件' : '创建会话后可查看本会话文件'}
+          onClick={onToggleSessionFiles}
+          className="inline-flex h-[30px] shrink-0 items-center gap-[5px] rounded-[8px] border-0 bg-transparent px-[8px] text-[12px] text-[#5b6273] transition-colors hover:bg-[#f1f2f5] hover:text-[#18181a] disabled:cursor-not-allowed disabled:opacity-45"
+        >
+          <StaffdeckIcon name="folder" size={16} />
+          <span className="max-[760px]:hidden">本会话文件</span>
+        </button>
         <LanguageSwitcher />
         <DropdownMenu>
           <DropdownMenuTrigger

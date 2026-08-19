@@ -319,6 +319,83 @@ def test_bubblewrap_network_policy_is_exact(tmp_path: Path) -> None:
     assert unsupported.value.error.code == "SANDBOX_POLICY_UNSUPPORTED"
 
 
+def test_governed_bubblewrap_allows_only_task_work_and_output(tmp_path: Path) -> None:
+    workspace = (tmp_path / "task").resolve()
+    argv = command_module._bubblewrap_argv(
+        sandbox_executable="/usr/bin/bwrap",
+        workspace=workspace,
+        command="true",
+        restrict_to_task_workspace_layout=True,
+    )
+
+    assert _all_option_pairs(argv, "--ro-bind")[-1] == [str(workspace), "/workspace"]
+    assert _all_option_pairs(argv, "--bind")[-2:] == [
+        [str(workspace / "work"), "/workspace/work"],
+        [str(workspace / "output"), "/workspace/output"],
+    ]
+    assert _option_values(argv, "--setenv") == ["HOME"]
+    home_index = argv.index("HOME")
+    temp_index = argv.index("TMPDIR")
+    assert argv[home_index + 1] == "/workspace/work/.home"
+    assert argv[temp_index + 1] == "/workspace/work/.tmp"
+
+
+def test_governed_srt_settings_write_only_task_work_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = (tmp_path / "task").resolve()
+    sandbox_temp = tmp_path / "runtime-temp"
+    workspace.mkdir()
+    sandbox_temp.mkdir()
+    monkeypatch.setattr(command_module, "_srt_supports_allow_all", lambda: True)
+
+    settings_path = command_module._write_srt_settings(
+        workspace,
+        network_mode="all",
+        sandbox_temp=sandbox_temp,
+        restrict_to_task_workspace_layout=True,
+    )
+    try:
+        filesystem = json.loads(settings_path.read_text())["filesystem"]
+    finally:
+        settings_path.unlink()
+
+    assert filesystem["allowWrite"] == [
+        str(workspace / "work"),
+        str(workspace / "output"),
+        str(sandbox_temp),
+    ]
+    assert str(workspace) in filesystem["allowRead"]
+
+
+def test_governed_bubblewrap_blocks_task_root_writes_when_available(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exercise the Linux mount policy, not just its generated argv."""
+
+    if not sys.platform.startswith("linux") or not command_module.shutil.which("bwrap"):
+        pytest.skip("Bubblewrap is unavailable in this test environment.")
+    monkeypatch.setattr(command_module, "available_backend", lambda: "bubblewrap")
+
+    result = _execute(
+        tmp_path,
+        {"command": """
+printf permitted > /workspace/work/permitted.txt
+printf blocked > /workspace/root.txt
+""".strip()},
+        enforce_task_workspace_layout=True,
+    )
+
+    workspace = tmp_path / "workspace"
+    assert result.success is True
+    assert result.data is not None
+    assert result.data["status"] == "failed"
+    permitted_file = workspace / "work" / "permitted.txt"
+    assert permitted_file.exists(), result.data["stderr"]
+    assert permitted_file.read_text() == "permitted"
+    assert not (workspace / "root.txt").exists()
+
+
 def test_srt_all_network_requires_reviewed_runtime_patch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -727,12 +804,14 @@ def _execute(
     arguments: dict[str, object],
     *,
     limits: HarnessLimits | None = None,
+    enforce_task_workspace_layout: bool = False,
 ):
     context = HarnessToolContext(
         run_id="run",
         task_frame_id="frame",
         workspace_root=(tmp_path / "workspace").resolve(),
         limits=limits or HarnessLimits(),
+        enforce_task_workspace_layout=enforce_task_workspace_layout,
     )
     return HarnessExecutor(build_command_tool_registry()).execute(
         context,
@@ -749,3 +828,11 @@ def _option_values(argv: list[str], option: str) -> list[str]:
     if option == "--bind":
         return argv[index + 1 : index + 3]
     return argv[index + 1 : index + 2]
+
+
+def _all_option_pairs(argv: list[str], option: str) -> list[list[str]]:
+    return [
+        argv[index + 1 : index + 3]
+        for index, value in enumerate(argv)
+        if value == option
+    ]

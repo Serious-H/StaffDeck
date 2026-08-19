@@ -29,6 +29,10 @@ from app.core.harness_session_lock import (
     acquire_harness_session,
     release_harness_session,
 )
+from app.core.harness_session_cleanup import (
+    harness_session_workspace_path,
+    harness_task_workspace_path,
+)
 from app.core.harness_turn_store import HarnessTurnStore
 from app.core.slash_commands import (
     SlashCommandError,
@@ -56,6 +60,11 @@ from app.db.models import (
     HarnessTurnRecord,
     Message,
     Skill,
+)
+from app.harness.errors import HarnessExecutionError
+from app.harness.workspace_files import (
+    list_session_workspace_file_refs,
+    materialize_workspace_file_ref,
 )
 from app.knowledge.citations import compact_knowledge_citation_labels
 from app.memory.service import memory_read
@@ -688,6 +697,22 @@ class HarnessV2Engine:
             user_id=request.user_id or "",
             db=self.db,
         )
+        dependency_workspace_files = _materialize_dependency_workspace_files(
+            self.db,
+            tenant_id=request.tenant_id,
+            session_id=session.id,
+            task_frame_id=row.task_id,
+            prior_frame_results=prior_frame_results,
+        )
+        session_workspace_files = [
+            file_ref.model_payload()
+            for file_ref in list_session_workspace_file_refs(
+                self.db,
+                tenant_id=request.tenant_id,
+                session_id=session.id,
+                limit=100,
+            )
+        ]
         image_payloads = validated_task_image_payloads(request.attachments)
         step_timeout_seconds = (
             _skill_step_timeout_seconds(active_skill)
@@ -741,6 +766,8 @@ class HarnessV2Engine:
                     *[_prior_result(item) for item in results],
                 ],
                 attachment_descriptors,
+                session_workspace_files=session_workspace_files,
+                dependency_workspace_files=dependency_workspace_files,
                 source_user_message=(
                     request.message
                     if row.source_turn_id == self.user_message_id
@@ -1635,6 +1662,81 @@ def _restore_session_state(
     session.context_state_json = deepcopy(state.get("context_state_json") or {})
     session.summary = state.get("summary")
     session.last_agent_question = state.get("last_agent_question")
+
+
+def _materialize_dependency_workspace_files(
+    db: Any,
+    *,
+    tenant_id: str,
+    session_id: str,
+    task_frame_id: str,
+    prior_frame_results: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Make declared direct-dependency outputs available as current task inputs."""
+
+    ref_ids: list[str] = []
+    for result in prior_frame_results:
+        if not isinstance(result, dict):
+            continue
+        artifacts = result.get("artifacts")
+        if not isinstance(artifacts, list):
+            continue
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            file_ref = artifact.get("workspace_file_ref")
+            ref_id = (
+                str(file_ref.get("ref_id") or "").strip()
+                if isinstance(file_ref, dict)
+                else ""
+            )
+            if ref_id and ref_id not in ref_ids:
+                ref_ids.append(ref_id)
+            if len(ref_ids) >= 20:
+                break
+    if not ref_ids:
+        return []
+
+    workspace_root = harness_task_workspace_path(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        task_frame_id=task_frame_id,
+        db=db,
+    )
+    session_workspace_root = harness_session_workspace_path(
+        tenant_id=tenant_id,
+        session_id=session_id,
+        db=db,
+    )
+    materialized_files: list[dict[str, Any]] = []
+    for ref_id in ref_ids:
+        try:
+            materialized = materialize_workspace_file_ref(
+                db,
+                tenant_id=tenant_id,
+                session_id=session_id,
+                task_frame_id=task_frame_id,
+                workspace_root=workspace_root,
+                session_workspace_root=session_workspace_root,
+                ref_id=ref_id,
+                input_directory="dependencies",
+            )
+        except HarnessExecutionError as exc:
+            materialized_files.append(
+                {
+                    "ref_id": ref_id,
+                    "materialized": False,
+                    "error": {
+                        "code": exc.error.code,
+                        "message": exc.error.message,
+                    },
+                }
+            )
+            continue
+        materialized_files.append(
+            {**materialized.model_payload(), "materialized": True}
+        )
+    return materialized_files
 
 
 def _prior_result(result: TaskExecutionResult) -> dict[str, Any]:

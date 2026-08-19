@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import os
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -27,7 +29,10 @@ from app.core.capability_manifest import (
     tool_snapshot_digest,
 )
 from app.core.harness_agent import HarnessExecutionCancelled
-from app.core.harness_session_cleanup import harness_task_workspace_path
+from app.core.harness_session_cleanup import (
+    harness_session_workspace_path,
+    harness_task_workspace_path,
+)
 from app.core.task_request_compiler import CapabilityDescriptor, CapabilityManifest
 from app.core.tool_replay_policy import ToolReplayPolicy
 from app.db.models import (
@@ -41,6 +46,10 @@ from app.db.models import (
     new_id,
     utc_now,
 )
+from app.general_skills.package_materialization import (
+    materialize_general_skill_package,
+    skill_package_directory_name,
+)
 from app.harness import (
     HarnessArtifactAccessError,
     HarnessExecutor,
@@ -52,18 +61,28 @@ from app.harness import (
     register_command_tools,
     snapshot_harness_workspace,
 )
-from app.harness.execution_context import SANDBOX_WORKSPACE
 from app.harness.errors import HarnessExecutionError
+from app.harness.execution_context import SANDBOX_WORKSPACE
 from app.harness.sandbox import parse_network_policy
+from app.harness.workspace_files import (
+    WORKSPACE_FILE_KIND_DELIVERABLE,
+    WORKSPACE_FILE_VISIBILITY_SESSION,
+    create_workspace_file_ref,
+    materialize_workspace_file_ref,
+)
+from app.harness.workspace_layout import (
+    TASK_OUTPUT_DIRECTORY,
+    ensure_task_workspace_layout,
+)
 from app.knowledge.citations import knowledge_citations_from_results
 from app.knowledge.schema import KnowledgeSearchRequest
 from app.knowledge.service import KnowledgeService
 from app.tools.tool_executor import ToolExecutor
 from app.tools.tool_schema import ToolCall
 
-
 _INLINE_JSON_TOOL_RESULT_MAX_CHARS = 2_000
 _INTERNAL_TOOL_RESULT_DIRECTORY = ".harness/tool-results"
+_INTERNAL_SKILL_PACKAGE_DIRECTORY = ".harness/skill_packages"
 _SANDBOX_JSON_FILE_KIND = "sandbox_json_file"
 
 
@@ -109,8 +128,14 @@ class HarnessCapabilityInvoker:
         self.workspace_root = _workspace_root(
             tenant_id, session.id, task_frame_id, db=self.db
         )
-        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self.workspace_layout = ensure_task_workspace_layout(self.workspace_root)
+        self.session_workspace_root = harness_session_workspace_path(
+            tenant_id=tenant_id,
+            session_id=session.id,
+            db=self.db,
+        )
         self._workspace_snapshot = snapshot_harness_workspace(self.workspace_root)
+        self._registered_session_artifact_paths: set[str] = set()
         ui_config = self.db.get(UIConfig, tenant_id)
         sandbox_enabled = bool(getattr(ui_config, "sandbox_enabled", False))
         sandbox_mode = parse_network_policy(
@@ -132,6 +157,7 @@ class HarnessCapabilityInvoker:
             sandbox_enabled=sandbox_enabled,
             sandbox_network_mode=sandbox_mode,
             sandbox_allowed_domains=sandbox_domains,
+            enforce_task_workspace_layout=True,
         )
         self._sandbox_network_mode = sandbox_mode
         self._sandbox_allowed_domains = sandbox_domains
@@ -280,7 +306,7 @@ class HarnessCapabilityInvoker:
                 self.task_frame_id,
                 self._workspace_snapshot,
                 operation="workspace_discovery",
-                path_filter=_is_user_facing_workspace_file,
+                path_filter=_is_task_output_path,
             )
         except (HarnessArtifactAccessError, OSError):
             return []
@@ -288,6 +314,8 @@ class HarnessCapabilityInvoker:
         for raw in discovered:
             item = dict(raw)
             relative_path = str(item.get("path") or "")
+            if relative_path in self._registered_session_artifact_paths:
+                continue
             display_name = Path(relative_path).name
             item.update(
                 {
@@ -300,8 +328,57 @@ class HarnessCapabilityInvoker:
                     "source": "harness.workspace_discovery",
                 }
             )
+            self._attach_session_file_ref(item)
             artifacts.append(item)
         return artifacts
+
+    def _attach_session_file_ref(
+        self,
+        artifact: dict[str, Any],
+        *,
+        required: bool = False,
+    ) -> None:
+        """Archive a TaskFrame output before exposing it as a user artifact."""
+
+        relative_path = str(artifact.get("path") or "").strip()
+        if not relative_path:
+            if required:
+                raise HarnessExecutionError(
+                    "WORKSPACE_FILE_PATH_INVALID",
+                    "无法归档没有路径的工作区交付物。",
+                )
+            return
+        try:
+            file_ref = create_workspace_file_ref(
+                self.db,
+                tenant_id=self.tenant_id,
+                session_id=self.session.id,
+                task_frame_id=self.task_frame_id,
+                workspace_root=self.workspace_root,
+                source_path=relative_path,
+                logical_path=_task_output_logical_path(relative_path),
+                kind=WORKSPACE_FILE_KIND_DELIVERABLE,
+                visibility=WORKSPACE_FILE_VISIBILITY_SESSION,
+                archive_workspace_root=self.session_workspace_root,
+                producer_invocation_id=self.run_id,
+            )
+        except HarnessExecutionError as exc:
+            self._emit_trace(
+                "workspace_file_archive_failed",
+                {
+                    "path": relative_path,
+                    "code": exc.error.code,
+                },
+            )
+            if required:
+                raise
+            artifact["workspace_file_ref_error"] = {
+                "code": exc.error.code,
+                "message": exc.error.message,
+            }
+            return
+        self._registered_session_artifact_paths.add(relative_path)
+        artifact["workspace_file_ref"] = file_ref.model_payload()
 
     def _logical_action_key(
         self,
@@ -416,21 +493,24 @@ class HarnessCapabilityInvoker:
             if name == "publish_artifact":
                 artifact_path = str(data.get("path") or "").strip()
                 if artifact_path:
-                    artifacts.append(
-                        {
-                            "type": "workspace_file",
-                            "task_frame_id": self.task_frame_id,
-                            "path": artifact_path,
-                            "sandbox_path": _sandbox_path(artifact_path),
-                            "sha256": data.get("sha256"),
-                            "size": data.get("size"),
-                            "display_name": data.get("display_name"),
-                            "description": data.get("description"),
-                            "content_type": data.get("content_type"),
-                            "operation": "publish_artifact",
-                            "source": "harness",
-                        }
-                    )
+                    artifact = {
+                        "type": "workspace_file",
+                        "task_frame_id": self.task_frame_id,
+                        "path": artifact_path,
+                        "sandbox_path": _sandbox_path(artifact_path),
+                        "sha256": data.get("sha256"),
+                        "size": data.get("size"),
+                        "display_name": data.get("display_name"),
+                        "description": data.get("description"),
+                        "content_type": data.get("content_type"),
+                        "operation": "publish_artifact",
+                        "source": "harness",
+                    }
+                    try:
+                        self._attach_session_file_ref(artifact, required=True)
+                    except HarnessExecutionError as exc:
+                        return _failure(exc.error.code, exc.error.message)
+                    artifacts.append(artifact)
             elif name in {"write_file", "edit_file", "copy_file", "move_file"}:
                 data["published"] = False
                 data["publication_hint"] = (
@@ -467,10 +547,46 @@ class HarnessCapabilityInvoker:
             return self._search_capabilities(arguments)
         if name == "capability_describe":
             return self._describe_capabilities(arguments)
+        if name == "workspace_file_materialize":
+            return self._materialize_workspace_file(arguments)
         return _failure(
             "UNSUPPORTED_INTERNAL_CAPABILITY",
             "不支持的 Harness 内部能力。",
         )
+
+    def _materialize_workspace_file(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        ref_id = str(arguments.get("ref_id") or "").strip()
+        if not ref_id:
+            return _failure(
+                "INVALID_ARGUMENTS",
+                "workspace_file_materialize ref_id 不能为空。",
+            )
+        try:
+            materialized = materialize_workspace_file_ref(
+                self.db,
+                tenant_id=self.tenant_id,
+                session_id=self.session.id,
+                task_frame_id=self.task_frame_id,
+                workspace_root=self.workspace_root,
+                session_workspace_root=self.session_workspace_root,
+                ref_id=ref_id,
+            )
+        except HarnessExecutionError as exc:
+            return _failure(
+                exc.error.code,
+                exc.error.message,
+                details=dict(exc.error.details),
+            )
+        payload = materialized.model_payload()
+        self._emit_trace(
+            "workspace_file_materialized",
+            {
+                "ref_id": ref_id,
+                "path": payload["path"],
+                "sha256": payload["sha256"],
+            },
+        )
+        return {"success": True, "data": payload}
 
     def _search_capabilities(self, arguments: dict[str, Any]) -> dict[str, Any]:
         query = str(arguments.get("query") or "").strip()
@@ -711,6 +827,15 @@ class HarnessCapabilityInvoker:
         metadata: dict[str, Any],
         query: str,
     ) -> dict[str, Any]:
+        package = package_from_row(skill)
+        package_relative_path = (
+            Path(_INTERNAL_SKILL_PACKAGE_DIRECTORY)
+            / skill_package_directory_name(skill.slug, package.digest)
+        ).as_posix()
+        materialize_general_skill_package(
+            skill,
+            self.workspace_root / package_relative_path,
+        )
         return {
             "success": True,
             "data": {
@@ -719,11 +844,17 @@ class HarnessCapabilityInvoker:
                 "operation": "read",
                 "query": query,
                 "package": _skill_package_preview(skill),
+                "package_workspace": {
+                    "relative_path": package_relative_path,
+                    "sandbox_path": _sandbox_path(package_relative_path),
+                    "entrypoint": package.entrypoint,
+                },
                 "notice": (
-                    "技能包说明已加载到当前隔离 Harness transcript；"
-                    "请由 AgentLoop 直接应用其中的 prompt、规则和示例，并按任务需要调用"
-                    "知识库、原装 Tool、exec_command 或 typed 文件工具；Skill 本身不会"
-                    "生成临时代码或启动第二套 runner。"
+                    "技能包说明已加载到当前隔离 Harness transcript，且真实包文件已物化到"
+                    "当前 TaskFrame。请直接使用 package_workspace.relative_path 下的文件，"
+                    "按任务需要调用知识库、原装 Tool、exec_command 或 typed 文件工具；"
+                    "不要用 write_file 重写技能包中的脚本。技能本身不会生成临时代码，"
+                    "也不会启动第二套 runner。"
                 ),
             },
         }
@@ -886,36 +1017,17 @@ class HarnessCapabilityInvoker:
             return payload
         if len(serialized) <= _INLINE_JSON_TOOL_RESULT_MAX_CHARS:
             return payload
-        stored = self._file_executor.execute(
-            self._file_context,
-            HarnessToolCall(
-                call_id=f"{call_id}-result",
-                name="write_file",
-                arguments={
-                    "path": f"{_INTERNAL_TOOL_RESULT_DIRECTORY}/{call_id}.json",
-                    "content": serialized,
-                    "create_parents": True,
-                },
-            ),
-        )
-        if not stored.success:
+        try:
+            stored_data = self._store_internal_json_result(call_id, serialized)
+        except HarnessExecutionError as exc:
             return _failure(
                 "TOOL_RESULT_PERSIST_FAILED",
                 "能力已返回结果，但完整 JSON 无法写入当前 TaskFrame 沙箱。",
                 cause={
-                    "code": (
-                        stored.error.code
-                        if stored.error is not None
-                        else "FILE_TOOL_ERROR"
-                    ),
-                    "message": (
-                        stored.error.message
-                        if stored.error is not None
-                        else "沙箱文件写入失败。"
-                    ),
+                    "code": exc.error.code,
+                    "message": exc.error.message,
                 },
             )
-        stored_data = dict(stored.data or {})
         relative_path = str(stored_data.get("path") or "").strip()
         reference = {
             "kind": _SANDBOX_JSON_FILE_KIND,
@@ -928,6 +1040,71 @@ class HarnessCapabilityInvoker:
         if isinstance(app_descriptor, dict):
             app_descriptor["initial_result"] = dict(reference)
         return payload
+
+    def _store_internal_json_result(
+        self,
+        call_id: str,
+        serialized: str,
+    ) -> dict[str, Any]:
+        """Persist a non-model-visible tool result beneath the reserved directory."""
+
+        encoded = serialized.encode("utf-8")
+        if len(encoded) > self._file_context.limits.max_file_bytes:
+            raise HarnessExecutionError(
+                "FILE_TOO_LARGE",
+                "完整 JSON 结果超过当前 TaskFrame 的单文件限制。",
+            )
+        normalized_call_id = str(call_id or "")
+        if not normalized_call_id or any(
+            character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
+            for character in normalized_call_id
+        ):
+            raise HarnessExecutionError(
+                "INVALID_TOOL_RESULT_REFERENCE",
+                "Harness 内部工具结果标识无效。",
+            )
+        filename = f"{normalized_call_id}.json"
+        relative_path = f"{_INTERNAL_TOOL_RESULT_DIRECTORY}/{filename}"
+        directory = self.workspace_root / ".harness" / "tool-results"
+        try:
+            for current in (self.workspace_root / ".harness", directory):
+                if current.is_symlink():
+                    raise HarnessExecutionError(
+                        "INVALID_WORKSPACE",
+                        "Harness 内部工具结果目录不能使用符号链接。",
+                    )
+                current.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if not current.is_dir() or current.is_symlink():
+                    raise HarnessExecutionError(
+                        "INVALID_WORKSPACE",
+                        "Harness 内部工具结果目录不可用。",
+                    )
+            descriptor, temporary = tempfile.mkstemp(
+                prefix=".result-",
+                dir=str(directory),
+            )
+            temporary_path = Path(temporary)
+            try:
+                with os.fdopen(descriptor, "wb") as handle:
+                    handle.write(encoded)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.chmod(temporary_path, 0o600)
+                os.replace(temporary_path, directory / filename)
+            finally:
+                temporary_path.unlink(missing_ok=True)
+        except HarnessExecutionError:
+            raise
+        except OSError as exc:
+            raise HarnessExecutionError(
+                "TOOL_RESULT_PERSIST_FAILED",
+                "无法写入 Harness 内部工具结果。",
+            ) from exc
+        return {
+            "path": relative_path,
+            "size": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
 
     def _resolve_json_tool_result_references(
         self,
@@ -1261,26 +1438,18 @@ def _model_visible_file_result(value: Any, *, key: str = "") -> Any:
     return value
 
 
-def _is_user_facing_workspace_file(path: str) -> bool:
-    parts = Path(path).parts
-    if not parts:
-        return False
-    first = parts[0]
-    if (
-        first in {"attachments", ".harness"}
-        or first.startswith("general_skill_")
-    ):
-        return False
-    if any(
-        part in {
-            ".git",
-            ".harness-trash",
-            ".pytest_cache",
-            "__pycache__",
-            "node_modules",
-        }
-        or part.startswith(".tmp-")
-        for part in parts
-    ):
-        return False
-    return Path(path).suffix.lower() not in {".pyc", ".pyo", ".part", ".tmp"}
+def _is_task_output_path(path: str) -> bool:
+    """Only output/ files can become automatic user-facing deliverables."""
+
+    normalized = str(path or "").replace("\\", "/").strip("/")
+    return normalized.startswith(f"{TASK_OUTPUT_DIRECTORY}/")
+
+
+def _task_output_logical_path(path: str) -> str:
+    """Keep TaskFrame implementation directories out of user file names."""
+
+    normalized = str(path or "").replace("\\", "/").strip("/")
+    sandbox_prefix = f"{SANDBOX_WORKSPACE}/"
+    normalized = normalized.removeprefix(sandbox_prefix)
+    prefix = f"{TASK_OUTPUT_DIRECTORY}/"
+    return normalized.removeprefix(prefix) if normalized.startswith(prefix) else normalized

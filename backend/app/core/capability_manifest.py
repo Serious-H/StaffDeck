@@ -36,6 +36,7 @@ RESERVED_HARNESS_CAPABILITY_NAMES = {
     "capability_describe",
     "exec_command",
     "knowledge_search",
+    "workspace_file_materialize",
 }
 
 
@@ -405,6 +406,30 @@ def _internal_capability_descriptors() -> list[CapabilityDescriptor]:
                 "additionalProperties": False,
             },
             metadata={"provider": "harness", "side_effect": "read"},
+        ),
+        CapabilityDescriptor(
+            capability_id="builtin.workspace.materialize",
+            name="workspace_file_materialize",
+            kind="internal",
+            description=(
+                "Copy one authorized file from this chat session's immutable file "
+                "manifest into the current TaskFrame input directory. Use a ref_id "
+                "listed in session_workspace_files when a later task, script, or "
+                "tool needs the actual file bytes."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "ref_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "A ref_id from session_workspace_files.",
+                    }
+                },
+                "required": ["ref_id"],
+                "additionalProperties": False,
+            },
+            metadata={"provider": "harness", "side_effect": "write"},
         ),
     ]
 

@@ -9,6 +9,7 @@ import time
 import traceback
 from collections.abc import Callable, Iterator
 from datetime import timedelta
+from typing import Literal
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
@@ -36,6 +37,7 @@ from app.db.models import (
     AgentProfile,
     ChatSession,
     HarnessTaskFrameRecord,
+    HarnessWorkspaceFileRecord,
     HumanHandoffRequest,
     Message,
     MessageFeedback,
@@ -52,6 +54,13 @@ from app.harness import (
     HarnessArtifactAccessError,
     normalize_harness_artifact_path,
     open_harness_artifact,
+)
+from app.harness.workspace_files import (
+    WORKSPACE_FILE_KIND_DELIVERABLE,
+    WORKSPACE_FILE_KIND_SOURCE,
+    WORKSPACE_FILE_VISIBILITY_SESSION,
+    WorkspaceFileRef,
+    open_workspace_file_ref,
 )
 from app.llm import LLMClient, LLMError
 from app.observability.spans import (
@@ -70,12 +79,12 @@ from app.session.attachments import (
     validate_chat_turn_attachments,
 )
 from app.session.helpers import public_session
+from app.session.message_read import message_read
 from app.session.message_visibility import (
     internal_message_turn_ids,
     visible_message_content,
     visible_message_rows,
 )
-from app.session.message_read import message_read
 from app.session.origin import pilotdeck_origin_session_ids
 from app.session.session_schema import (
     ChatAttachmentRead,
@@ -181,6 +190,17 @@ class ChatTurnCancelRequest(BaseModel):
 class HumanHandoffReplyRequest(BaseModel):
     tenant_id: str
     reply: str
+
+
+class SessionWorkspaceFileRead(BaseModel):
+    """A user-facing entry in one chat session's durable file area."""
+
+    id: str
+    filename: str
+    category: Literal["upload", "generated"]
+    size: int
+    content_type: str
+    created_at: str
 
 
 def session_read(
@@ -2143,17 +2163,29 @@ def download_harness_artifact(
     if artifact is None:
         raise HTTPException(status_code=404, detail="Artifact not found")
 
+    workspace_file_ref = _artifact_workspace_file_ref(
+        db,
+        artifact=artifact,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        task_frame_id=task_frame_id,
+    )
     opened = None
     try:
-        opened = open_harness_artifact(
-            harness_task_workspace_path(
-                tenant_id=tenant_id,
-                session_id=session_id,
-                task_frame_id=task_frame_id,
-                db=db,
-            ),
-            path,
-        )
+        if workspace_file_ref is not None:
+            opened = open_workspace_file_ref(workspace_file_ref)
+        else:
+            # Backward compatibility for artifacts created before the durable
+            # session file registry existed.
+            opened = open_harness_artifact(
+                harness_task_workspace_path(
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    task_frame_id=task_frame_id,
+                    db=db,
+                ),
+                path,
+            )
         digest = opened.sha256()
         expected_digest = str(artifact.get("sha256") or "").strip().lower()
         expected_size = artifact.get("size")
@@ -2174,6 +2206,144 @@ def download_harness_artifact(
     fallback_filename = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._")
     fallback_filename = (fallback_filename or "artifact")[:120]
     media_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    return StreamingResponse(
+        opened.iter_bytes(),
+        media_type=media_type,
+        headers={
+            "Cache-Control": "private, no-store",
+            "Content-Disposition": (
+                f'attachment; filename="{fallback_filename}"; '
+                f"filename*=UTF-8''{quote(filename, safe='')}"
+            ),
+            "Content-Length": str(opened.size),
+            "ETag": f'"sha256:{digest}"',
+            "X-Content-Type-Options": "nosniff",
+        },
+        background=BackgroundTask(opened.close),
+    )
+
+
+@router.get(
+    "/sessions/{session_id}/workspace-files",
+    response_model=list[SessionWorkspaceFileRead],
+)
+def list_session_workspace_files(
+    session_id: str,
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> list[SessionWorkspaceFileRead]:
+    """List the session's original uploads and latest named deliverables.
+
+    Task-local work files, internal data and parser-derived representations are
+    intentionally absent.  They remain available to the governed execution
+    protocol, without becoming confusing user downloads.
+    """
+
+    _ensure_request_tenant(tenant_id, current_user)
+    _get_readable_chat_session(db, tenant_id, current_user, session_id)
+    rows = db.exec(
+        select(HarnessWorkspaceFileRecord)
+        .where(
+            HarnessWorkspaceFileRecord.tenant_id == tenant_id,
+            HarnessWorkspaceFileRecord.session_id == session_id,
+            HarnessWorkspaceFileRecord.visibility
+            == WORKSPACE_FILE_VISIBILITY_SESSION,
+            HarnessWorkspaceFileRecord.kind.in_(  # type: ignore[attr-defined]
+                [WORKSPACE_FILE_KIND_SOURCE, WORKSPACE_FILE_KIND_DELIVERABLE]
+            ),
+        )
+        .order_by(HarnessWorkspaceFileRecord.created_at.desc())
+        .limit(200)
+    ).all()
+    display_names = _session_workspace_file_display_names(
+        db,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        rows=rows,
+    )
+    latest_deliverable_paths: set[str] = set()
+    files: list[SessionWorkspaceFileRead] = []
+    for row in rows:
+        if row.kind == WORKSPACE_FILE_KIND_DELIVERABLE:
+            if row.logical_path in latest_deliverable_paths:
+                continue
+            latest_deliverable_paths.add(row.logical_path)
+        files.append(
+            SessionWorkspaceFileRead(
+                id=row.id,
+                filename=(
+                    display_names.get(row.id)
+                    or _workspace_file_basename(row.logical_path)
+                ),
+                category=(
+                    "upload"
+                    if row.kind == WORKSPACE_FILE_KIND_SOURCE
+                    else "generated"
+                ),
+                size=row.size,
+                content_type=row.content_type,
+                created_at=row.created_at.isoformat(),
+            )
+        )
+    return files
+
+
+@router.get("/sessions/{session_id}/workspace-files/{file_id}/download")
+def download_session_workspace_file(
+    session_id: str,
+    file_id: str,
+    tenant_id: str = Query(...),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_session),
+) -> StreamingResponse:
+    """Download one durable original upload or final deliverable."""
+
+    _ensure_request_tenant(tenant_id, current_user)
+    _get_readable_chat_session(db, tenant_id, current_user, session_id)
+    row = db.get(HarnessWorkspaceFileRecord, file_id)
+    if (
+        row is None
+        or row.tenant_id != tenant_id
+        or row.session_id != session_id
+        or row.visibility != WORKSPACE_FILE_VISIBILITY_SESSION
+        or row.kind
+        not in {WORKSPACE_FILE_KIND_SOURCE, WORKSPACE_FILE_KIND_DELIVERABLE}
+    ):
+        raise HTTPException(status_code=404, detail="Workspace file not found")
+
+    file_ref = WorkspaceFileRef.from_record(row)
+    opened = None
+    try:
+        opened = open_workspace_file_ref(file_ref)
+        digest = opened.sha256()
+        if digest.lower() != file_ref.sha256.lower() or opened.size != file_ref.size:
+            opened.close()
+            raise HTTPException(
+                status_code=409,
+                detail="Workspace file has changed",
+            )
+    except (HarnessArtifactAccessError, OSError):
+        if opened is not None:
+            opened.close()
+        raise HTTPException(status_code=404, detail="Workspace file not found") from None
+
+    filename = (
+        _session_workspace_file_display_names(
+            db,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            rows=[row],
+        ).get(row.id)
+        or _workspace_file_basename(file_ref.logical_path)
+    )
+    fallback_filename = re.sub(r"[^A-Za-z0-9._-]+", "_", filename).strip("._")
+    fallback_filename = (fallback_filename or "workspace-file")[:120]
+    media_type = (
+        file_ref.content_type
+        or mimetypes.guess_type(filename)[0]
+        or "application/octet-stream"
+    )
     return StreamingResponse(
         opened.iter_bytes(),
         media_type=media_type,
@@ -2527,6 +2697,35 @@ def _published_workspace_artifact(
     return None
 
 
+def _artifact_workspace_file_ref(
+    db: Session,
+    *,
+    artifact: dict[str, object],
+    tenant_id: str,
+    session_id: str,
+    task_frame_id: str,
+) -> WorkspaceFileRef | None:
+    """Resolve an artifact's durable file ref without trusting message data."""
+
+    raw_ref = artifact.get("workspace_file_ref")
+    if not isinstance(raw_ref, dict):
+        return None
+    ref_id = str(raw_ref.get("ref_id") or "").strip()
+    if not ref_id:
+        return None
+    record = db.get(HarnessWorkspaceFileRecord, ref_id)
+    if (
+        record is None
+        or record.tenant_id != tenant_id
+        or record.session_id != session_id
+        or record.task_frame_id != task_frame_id
+        or record.visibility != WORKSPACE_FILE_VISIBILITY_SESSION
+        or record.kind != WORKSPACE_FILE_KIND_DELIVERABLE
+    ):
+        raise HTTPException(status_code=404, detail="Artifact not found")
+    return WorkspaceFileRef.from_record(record)
+
+
 def _safe_artifact_download_name(filename: str) -> str:
     cleaned = "".join(
         character
@@ -2535,6 +2734,48 @@ def _safe_artifact_download_name(filename: str) -> str:
         and (character.isprintable() or character == "\t")
     ).strip()
     return cleaned[:180] or "artifact"
+
+
+def _workspace_file_basename(logical_path: str) -> str:
+    value = str(logical_path or "").replace("\\", "/").rstrip("/")
+    return _safe_artifact_download_name(value.rsplit("/", maxsplit=1)[-1])
+
+
+def _session_workspace_file_display_names(
+    db: Session,
+    *,
+    tenant_id: str,
+    session_id: str,
+    rows: list[HarnessWorkspaceFileRecord],
+) -> dict[str, str]:
+    """Use an explicitly published display name when one was recorded."""
+
+    wanted_ids = {row.id for row in rows}
+    if not wanted_ids:
+        return {}
+    messages = db.exec(
+        select(Message).where(
+            Message.tenant_id == tenant_id,
+            Message.session_id == session_id,
+            Message.role == "assistant",
+        )
+    ).all()
+    names: dict[str, str] = {}
+    for message in messages:
+        artifacts = (message.metadata_json or {}).get("harness_artifacts")
+        if not isinstance(artifacts, list):
+            continue
+        for artifact in artifacts:
+            if not isinstance(artifact, dict):
+                continue
+            raw_ref = artifact.get("workspace_file_ref")
+            if not isinstance(raw_ref, dict):
+                continue
+            ref_id = str(raw_ref.get("ref_id") or "").strip()
+            display_name = str(artifact.get("display_name") or "").strip()
+            if ref_id in wanted_ids and display_name:
+                names[ref_id] = _safe_artifact_download_name(display_name)
+    return names
 
 
 def _user_can_read_handoff_session(db: Session, tenant_id: str, current_user: User, session_id: str) -> bool:

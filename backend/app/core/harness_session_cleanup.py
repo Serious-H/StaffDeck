@@ -14,6 +14,7 @@ from app.db.models import (
     HarnessSessionLeaseRecord,
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
+    HarnessWorkspaceFileRecord,
     UIConfig,
     utc_now,
 )
@@ -26,6 +27,7 @@ class HarnessSessionRecordCleanup:
     invocation_count: int
     run_count: int
     task_frame_count: int
+    workspace_file_count: int
 
 
 def stage_harness_session_execution_reset(
@@ -138,6 +140,12 @@ def stage_harness_session_record_deletion(
             HarnessSessionLeaseRecord.session_id == session_id,
         )
     ).all()
+    workspace_files = db.exec(
+        select(HarnessWorkspaceFileRecord).where(
+            HarnessWorkspaceFileRecord.tenant_id == tenant_id,
+            HarnessWorkspaceFileRecord.session_id == session_id,
+        )
+    ).all()
 
     for invocation in invocations:
         db.delete(invocation)
@@ -154,6 +162,9 @@ def stage_harness_session_record_deletion(
     for session_lease in session_leases:
         db.delete(session_lease)
     db.flush()
+    for workspace_file in workspace_files:
+        db.delete(workspace_file)
+    db.flush()
 
     return HarnessSessionRecordCleanup(
         session_lease_count=len(session_leases),
@@ -161,6 +172,7 @@ def stage_harness_session_record_deletion(
         invocation_count=len(invocations),
         run_count=len(runs),
         task_frame_count=len(task_frames),
+        workspace_file_count=len(workspace_files),
     )
 
 

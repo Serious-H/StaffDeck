@@ -20,6 +20,7 @@ from app.db.models import (
     HarnessSessionLeaseRecord,
     HarnessTaskFrameRecord,
     HarnessTurnRecord,
+    HarnessWorkspaceFileRecord,
     Tenant,
     User,
 )
@@ -68,6 +69,20 @@ def _add_harness_records(
         request_digest=f"digest_{suffix}",
     )
     db.add_all([task_frame, run, invocation])
+    db.add(
+        HarnessWorkspaceFileRecord(
+            id=f"hwfile_{suffix}",
+            tenant_id=tenant_id,
+            session_id=session_id,
+            task_frame_id=task_frame.task_id,
+            logical_path="report.md",
+            storage_path=".harness/files/digest",
+            sha256=f"digest_{suffix}",
+            size=1,
+            kind="deliverable",
+            visibility="session",
+        )
+    )
     db.add(
         HarnessTurnRecord(
             id=f"hturn_{suffix}",
@@ -126,13 +141,17 @@ def test_stage_harness_record_deletion_is_tenant_and_session_scoped() -> None:
         assert result.task_frame_count == 1
         assert result.turn_count == 1
         assert result.session_lease_count == 1
+        assert result.workspace_file_count == 1
         assert db.get(HarnessInvocationRecord, target_ids[0]) is None
         assert db.get(HarnessRunRecord, target_ids[1]) is None
         assert db.get(HarnessTaskFrameRecord, target_ids[2]) is None
+        assert db.get(HarnessWorkspaceFileRecord, "hwfile_target") is None
         for record_ids in (same_tenant_ids, same_session_ids):
             assert db.get(HarnessInvocationRecord, record_ids[0]) is not None
             assert db.get(HarnessRunRecord, record_ids[1]) is not None
             assert db.get(HarnessTaskFrameRecord, record_ids[2]) is not None
+        assert db.get(HarnessWorkspaceFileRecord, "hwfile_same_tenant") is not None
+        assert db.get(HarnessWorkspaceFileRecord, "hwfile_same_session") is not None
 
 
 def test_workspace_cleanup_uses_invoker_segment_and_removes_only_target(

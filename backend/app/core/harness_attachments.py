@@ -1,31 +1,35 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import hashlib
 import os
 import tempfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+
 from sqlmodel import Session
 
 from app.core.harness_session_cleanup import (
-    harness_path_segment,
+    harness_session_workspace_path,
     harness_task_workspace_path,
 )
-from app.harness import (
-    HarnessExecutor,
-    HarnessToolCall,
-    HarnessToolContext,
-    build_file_tool_registry,
+from app.harness.errors import HarnessExecutionError
+from app.harness.execution_context import SANDBOX_WORKSPACE
+from app.harness.workspace_files import (
+    WORKSPACE_FILE_KIND_DERIVED,
+    WORKSPACE_FILE_KIND_SOURCE,
+    WORKSPACE_FILE_VISIBILITY_SESSION,
+    create_workspace_file_ref,
+)
+from app.harness.workspace_layout import ensure_task_workspace_layout
+from app.session.attachment_store import (
+    read_staged_chat_attachment,
+    sandbox_attachment_path,
 )
 from app.session.attachments import (
     IMAGE_DATA_URL_LIMIT_BYTES,
     image_payloads_from_attachments,
     validate_chat_turn_attachments,
-)
-from app.session.attachment_store import (
-    read_staged_chat_attachment,
-    sandbox_attachment_path,
 )
 from app.session.session_schema import ChatAttachmentRead
 
@@ -58,13 +62,7 @@ def materialize_task_attachments(
         task_frame_id=task_frame_id,
         db=db,
     )
-    context = HarnessToolContext(
-        run_id=f"attachments-{harness_path_segment(task_frame_id)}",
-        tenant_id=tenant_id,
-        task_frame_id=task_frame_id,
-        workspace_root=workspace,
-    )
-    executor = HarnessExecutor(build_file_tool_registry())
+    ensure_task_workspace_layout(workspace)
     descriptors: list[dict[str, Any]] = []
     for index, attachment in enumerate(attachments, start=1):
         staged_data = read_staged_chat_attachment(
@@ -92,8 +90,8 @@ def materialize_task_attachments(
                     }
                 )
         if staged_data is not None:
-            sandbox_path = sandbox_attachment_path(attachment, index)
-            relative_path = sandbox_path.removeprefix("/workspace/")
+            relative_path = _input_attachment_relative_path(attachment, index)
+            sandbox_path = f"{SANDBOX_WORKSPACE}/{relative_path}"
             try:
                 _write_workspace_bytes(workspace, relative_path, staged_data)
                 descriptor.update(
@@ -106,6 +104,17 @@ def materialize_task_attachments(
                         "note": "原始附件已写入当前 TaskFrame 沙箱。",
                     }
                 )
+                _attach_workspace_file_ref(
+                    descriptor,
+                    db=db,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    task_frame_id=task_frame_id,
+                    workspace=workspace,
+                    source_path=relative_path,
+                    logical_path=_attachment_logical_path(attachment, index),
+                    kind=WORKSPACE_FILE_KIND_SOURCE,
+                )
             except OSError as exc:
                 descriptor.update(
                     {
@@ -114,43 +123,46 @@ def materialize_task_attachments(
                     }
                 )
             if attachment.kind == "pdf" and attachment.text:
-                extracted_path = f"{sandbox_path}.extracted.txt"
-                extracted_result = executor.execute(
-                    context,
-                    HarnessToolCall(
-                        call_id=f"attachment-text-{index}",
-                        name="write_file",
-                        arguments={
-                            "path": extracted_path,
-                            "content": attachment.text,
-                            "create_parents": True,
-                        },
-                    ),
-                )
-                if extracted_result.success:
-                    descriptor["extracted_text_path"] = extracted_path
+                extracted_relative_path = f"{relative_path}.extracted.txt"
+                try:
+                    _write_workspace_bytes(
+                        workspace,
+                        extracted_relative_path,
+                        attachment.text.encode("utf-8"),
+                    )
+                    descriptor["extracted_text_path"] = (
+                        f"{SANDBOX_WORKSPACE}/{extracted_relative_path}"
+                    )
+                    _attach_workspace_file_ref(
+                        descriptor,
+                        db=db,
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        task_frame_id=task_frame_id,
+                        workspace=workspace,
+                        source_path=extracted_relative_path,
+                        logical_path=(
+                            f"{_attachment_logical_path(attachment, index)}.extracted.txt"
+                        ),
+                        kind=WORKSPACE_FILE_KIND_DERIVED,
+                        payload_key="extracted_text_file_ref",
+                    )
+                except OSError as exc:
+                    descriptor["extracted_text_error"] = (
+                        f"附件提取文本写入失败：{type(exc).__name__}"
+                    )
         elif attachment.text:
-            sandbox_path = sandbox_attachment_path(attachment, index)
-            result = executor.execute(
-                context,
-                HarnessToolCall(
-                    call_id=f"attachment-{index}",
-                    name="write_file",
-                    arguments={
-                        "path": sandbox_path,
-                        "content": attachment.text,
-                        "create_parents": True,
-                    },
-                ),
-            )
-            if result.success:
-                data = dict(result.data or {})
+            relative_path = _input_attachment_relative_path(attachment, index)
+            sandbox_path = f"{SANDBOX_WORKSPACE}/{relative_path}"
+            try:
+                text_data = attachment.text.encode("utf-8")
+                _write_workspace_bytes(workspace, relative_path, text_data)
                 descriptor.update(
                     {
                         "workspace_path": sandbox_path,
-                        "workspace_relative_path": sandbox_path.removeprefix("/workspace/"),
+                        "workspace_relative_path": relative_path,
                         "sandbox_path": sandbox_path,
-                        "sha256": data.get("sha256"),
+                        "sha256": hashlib.sha256(text_data).hexdigest(),
                         "materialized": True,
                         "note": (
                             "未找到原始上传暂存；PDF 附件保存的是服务端提取文本。"
@@ -159,15 +171,22 @@ def materialize_task_attachments(
                         ),
                     }
                 )
-            else:
+                _attach_workspace_file_ref(
+                    descriptor,
+                    db=db,
+                    tenant_id=tenant_id,
+                    session_id=session_id,
+                    task_frame_id=task_frame_id,
+                    workspace=workspace,
+                    source_path=relative_path,
+                    logical_path=_attachment_logical_path(attachment, index),
+                    kind=WORKSPACE_FILE_KIND_DERIVED,
+                )
+            except OSError as exc:
                 descriptor.update(
                     {
                         "materialized": False,
-                        "error": (
-                            result.error.message
-                            if result.error is not None
-                            else "附件写入失败。"
-                        ),
+                        "error": f"附件写入失败：{type(exc).__name__}",
                     }
                 )
         else:
@@ -354,3 +373,60 @@ def _write_workspace_bytes(workspace: Path, relative_path: str, data: bytes) -> 
         os.replace(temporary_path, destination)
     finally:
         temporary_path.unlink(missing_ok=True)
+
+
+def _input_attachment_relative_path(
+    attachment: ChatAttachmentRead,
+    index: int,
+) -> str:
+    return "input/" + sandbox_attachment_path(attachment, index).removeprefix(
+        f"{SANDBOX_WORKSPACE}/"
+    )
+
+
+def _attachment_logical_path(attachment: ChatAttachmentRead, index: int) -> str:
+    basename = Path(str(attachment.filename or "").replace("\\", "/")).name
+    return basename or f"attachment-{index}.bin"
+
+
+def _attach_workspace_file_ref(
+    descriptor: dict[str, Any],
+    *,
+    db: Session | None,
+    tenant_id: str,
+    session_id: str,
+    task_frame_id: str,
+    workspace: Path,
+    source_path: str,
+    logical_path: str,
+    kind: str,
+    payload_key: str = "workspace_file_ref",
+) -> None:
+    """Register a materialized attachment as a durable session input snapshot."""
+
+    if db is None:
+        return
+    try:
+        file_ref = create_workspace_file_ref(
+            db,
+            tenant_id=tenant_id,
+            session_id=session_id,
+            task_frame_id=task_frame_id,
+            workspace_root=workspace,
+            source_path=source_path,
+            logical_path=logical_path,
+            kind=kind,
+            visibility=WORKSPACE_FILE_VISIBILITY_SESSION,
+            archive_workspace_root=harness_session_workspace_path(
+                tenant_id=tenant_id,
+                session_id=session_id,
+                db=db,
+            ),
+        )
+    except HarnessExecutionError as exc:
+        descriptor[f"{payload_key}_error"] = {
+            "code": exc.error.code,
+            "message": exc.error.message,
+        }
+        return
+    descriptor[payload_key] = file_ref.model_payload()

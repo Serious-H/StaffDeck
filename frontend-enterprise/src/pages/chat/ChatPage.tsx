@@ -1,4 +1,4 @@
-import { type CSSProperties } from 'react';
+import { type CSSProperties, useState } from 'react';
 
 import AppSidebar from '@/components/AppSidebar';
 import { SidebarProvider } from '@/components/ui/sidebar';
@@ -11,9 +11,11 @@ import ChatHeader from './components/ChatHeader';
 import MessageList from './components/MessageList';
 import Composer from './components/Composer';
 import ChatDialogs from './components/ChatDialogs';
+import SessionWorkspaceFilesDrawer from './components/SessionWorkspaceFilesDrawer';
 
 export default function ChatPage() {
   const chat = useChatSession();
+  const [sessionFilesOpen, setSessionFilesOpen] = useState(false);
 
   return (
     <SidebarProvider
@@ -56,10 +58,20 @@ export default function ChatPage() {
         onOpenAdmin={chat.openAdmin}
       />
       <main className={cn(CHAT_MAIN_CLASS, 'flex-1')}>
-        <ChatHeader chat={chat} />
+        <ChatHeader
+          chat={chat}
+          sessionFilesOpen={sessionFilesOpen}
+          onToggleSessionFiles={() => setSessionFilesOpen((open) => !open)}
+        />
         <MessageList chat={chat} />
         <Composer chat={chat} />
       </main>
+      <SessionWorkspaceFilesDrawer
+        open={sessionFilesOpen}
+        sessionId={chat.sessionId}
+        tenantId={chat.tenantId}
+        onClose={() => setSessionFilesOpen(false)}
+      />
       <ChatDialogs chat={chat} />
     </SidebarProvider>
   );

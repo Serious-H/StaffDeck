@@ -68,6 +68,10 @@ class TaskRequirement(BaseModel):
     memory_projection: list[dict[str, str]] = Field(default_factory=list)
     prior_task_results: list[dict[str, Any]] = Field(default_factory=list)
     attachments: list[dict[str, Any]] = Field(default_factory=list)
+    # Immutable session files are metadata only. The Agent must call
+    # workspace_file_materialize before a script or tool consumes their bytes.
+    session_workspace_files: list[dict[str, Any]] = Field(default_factory=list)
+    dependency_workspace_files: list[dict[str, Any]] = Field(default_factory=list)
     capability_manifest: CapabilityManifest = Field(default_factory=CapabilityManifest)
 
 
@@ -105,6 +109,8 @@ class TaskRequestCompiler:
         memory_context: list[dict[str, object]] | None = None,
         prior_task_results: list[dict[str, Any]] | None = None,
         attachments: list[dict[str, Any]] | None = None,
+        session_workspace_files: list[dict[str, Any]] | None = None,
+        dependency_workspace_files: list[dict[str, Any]] | None = None,
         source_user_message: str | None = None,
     ) -> TaskRequirement:
         current_node = _current_node(skill, frame.target_step_id or session.active_step_id)
@@ -175,6 +181,8 @@ class TaskRequestCompiler:
             memory_projection=_memory_projection(memory_context),
             prior_task_results=list(prior_task_results or []),
             attachments=list(attachments or []),
+            session_workspace_files=list(session_workspace_files or []),
+            dependency_workspace_files=list(dependency_workspace_files or []),
             capability_manifest=manifest,
         )
 

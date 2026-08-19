@@ -15,14 +15,27 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.harness.contracts import HarnessToolContext
-from app.harness.execution_context import SANDBOX_WORKSPACE
 from app.harness.errors import HarnessExecutionError
+from app.harness.execution_context import SANDBOX_WORKSPACE
 from app.harness.registry import HarnessRegistry
+from app.harness.workspace_layout import (
+    TASK_INPUT_DIRECTORY,
+    TASK_OUTPUT_DIRECTORY,
+    TASK_WORK_DIRECTORY,
+)
 from app.knowledge.parser import KnowledgeParseError, extract_text
 
 _TRASH_DIRECTORY = ".harness-trash"
+_WORKSPACE_INTERNAL_DIRECTORY = ".harness"
 _SHA256_PATTERN = r"^[A-Fa-f0-9]{64}$"
 _MAX_GREP_LINE_CHARS = 400
+_TASK_READABLE_ROOTS = {
+    TASK_INPUT_DIRECTORY,
+    TASK_WORK_DIRECTORY,
+    TASK_OUTPUT_DIRECTORY,
+}
+_TASK_WRITABLE_ROOTS = {TASK_WORK_DIRECTORY, TASK_OUTPUT_DIRECTORY}
+_TASK_PUBLISHABLE_ROOTS = {TASK_OUTPUT_DIRECTORY}
 
 
 class _FileArguments(BaseModel):
@@ -147,12 +160,38 @@ class _Workspace:
         raw_path: str,
         *,
         allow_root: bool = False,
+        allowed_roots: set[str] | None = None,
+        allow_internal_tool_results: bool = False,
     ) -> Path:
         normalized = _normalize_relative_path(raw_path, allow_root=allow_root)
         if _TRASH_DIRECTORY in normalized.parts:
             raise HarnessExecutionError(
                 "RESERVED_PATH",
                 "The Harness internal trash directory is not directly accessible.",
+                details={"path": normalized.as_posix()},
+            )
+        is_internal_tool_result = (
+            allow_internal_tool_results
+            and normalized.parts[:2] == (_WORKSPACE_INTERNAL_DIRECTORY, "tool-results")
+        )
+        if _WORKSPACE_INTERNAL_DIRECTORY in normalized.parts and not is_internal_tool_result:
+            raise HarnessExecutionError(
+                "RESERVED_PATH",
+                "The Harness internal workspace directory is not directly accessible.",
+                details={"path": normalized.as_posix()},
+            )
+        if (
+            self.context.enforce_task_workspace_layout
+            and normalized.parts
+            and not is_internal_tool_result
+            and (
+                allowed_roots is None
+                or normalized.parts[0] not in allowed_roots
+            )
+        ):
+            raise HarnessExecutionError(
+                "WORKSPACE_PATH_SCOPE_DENIED",
+                "该操作不能访问指定的 TaskFrame 工作区目录。",
                 details={"path": normalized.as_posix()},
             )
 
@@ -382,7 +421,11 @@ def read_file(
 ) -> dict[str, Any]:
     args = _as(arguments, ReadFileArguments)
     workspace = _Workspace(context)
-    path = workspace.resolve(args.path)
+    path = workspace.resolve(
+        args.path,
+        allowed_roots=_TASK_READABLE_ROOTS,
+        allow_internal_tool_results=True,
+    )
     metadata = workspace.require_file(path)
     workspace.ensure_file_size(metadata.st_size)
     if args.offset > metadata.st_size:
@@ -437,7 +480,7 @@ def extract_document_text(
 
     args = _as(arguments, ExtractDocumentTextArguments)
     workspace = _Workspace(context)
-    source = workspace.resolve(args.path)
+    source = workspace.resolve(args.path, allowed_roots=_TASK_READABLE_ROOTS)
     source_metadata = workspace.require_file(source)
     workspace.ensure_file_size(source_metadata.st_size)
     try:
@@ -463,8 +506,13 @@ def extract_document_text(
             },
         ) from exc
 
-    output_raw = args.output_path or f"{workspace.relative(source)}.extracted.txt"
-    output = workspace.resolve(output_raw)
+    output_raw = args.output_path
+    if not output_raw:
+        if context.enforce_task_workspace_layout:
+            output_raw = f"{TASK_WORK_DIRECTORY}/{source.name}.extracted.txt"
+        else:
+            output_raw = f"{workspace.relative(source)}.extracted.txt"
+    output = workspace.resolve(output_raw, allowed_roots=_TASK_WRITABLE_ROOTS)
     if output == source:
         raise HarnessExecutionError(
             "INVALID_PATH",
@@ -498,7 +546,7 @@ def write_file(
 ) -> dict[str, Any]:
     args = _as(arguments, WriteFileArguments)
     workspace = _Workspace(context)
-    path = workspace.resolve(args.path)
+    path = workspace.resolve(args.path, allowed_roots=_TASK_WRITABLE_ROOTS)
     workspace.prepare_parent(path, create=args.create_parents)
     content_bytes = args.content.encode("utf-8")
     workspace.ensure_file_size(len(content_bytes))
@@ -538,7 +586,7 @@ def edit_file(
 ) -> dict[str, Any]:
     args = _as(arguments, EditFileArguments)
     workspace = _Workspace(context)
-    path = workspace.resolve(args.path)
+    path = workspace.resolve(args.path, allowed_roots=_TASK_WRITABLE_ROOTS)
     metadata = workspace.require_file(path)
     workspace.ensure_file_size(metadata.st_size)
     previous_sha256 = workspace.assert_expected_hash(path, args.expected_sha256)
@@ -585,7 +633,11 @@ def list_directory(
 ) -> dict[str, Any]:
     args = _as(arguments, ListDirectoryArguments)
     workspace = _Workspace(context)
-    path = workspace.resolve(args.path, allow_root=True)
+    path = workspace.resolve(
+        args.path,
+        allow_root=True,
+        allowed_roots=_TASK_READABLE_ROOTS,
+    )
     workspace.require_directory(path)
     limit = _entry_limit(args.max_entries, context)
     entries: list[dict[str, Any]] = []
@@ -597,7 +649,7 @@ def list_directory(
         iterator = iter(sorted(path.iterdir(), key=lambda item: item.name))
 
     for child in iterator:
-        if child.name == _TRASH_DIRECTORY and child.parent == workspace.root:
+        if child.name in {_TRASH_DIRECTORY, _WORKSPACE_INTERNAL_DIRECTORY} and child.parent == workspace.root:
             continue
         if len(entries) >= limit:
             truncated = True
@@ -621,7 +673,11 @@ def glob_files(
 ) -> dict[str, Any]:
     args = _as(arguments, GlobArguments)
     workspace = _Workspace(context)
-    start = workspace.resolve(args.path, allow_root=True)
+    start = workspace.resolve(
+        args.path,
+        allow_root=True,
+        allowed_roots=_TASK_READABLE_ROOTS,
+    )
     workspace.require_directory(start)
     pattern = _normalize_glob(args.pattern)
     limit = _entry_limit(args.max_results, context)
@@ -655,7 +711,11 @@ def grep_files(
 ) -> dict[str, Any]:
     args = _as(arguments, GrepArguments)
     workspace = _Workspace(context)
-    start = workspace.resolve(args.path, allow_root=True)
+    start = workspace.resolve(
+        args.path,
+        allow_root=True,
+        allowed_roots=_TASK_READABLE_ROOTS,
+    )
     if not start.exists():
         raise HarnessExecutionError(
             "NOT_FOUND",
@@ -732,7 +792,7 @@ def file_info(
 ) -> dict[str, Any]:
     args = _as(arguments, FileInfoArguments)
     workspace = _Workspace(context)
-    path = workspace.resolve(args.path)
+    path = workspace.resolve(args.path, allowed_roots=_TASK_READABLE_ROOTS)
     workspace._reject_symlink_components(path)
     try:
         metadata = path.lstat()
@@ -768,7 +828,7 @@ def publish_artifact(
 
     args = _as(arguments, PublishArtifactArguments)
     workspace = _Workspace(context)
-    path = workspace.resolve(args.path)
+    path = workspace.resolve(args.path, allowed_roots=_TASK_PUBLISHABLE_ROOTS)
     metadata = workspace.require_file(path)
     workspace.ensure_file_size(metadata.st_size)
     display_name = _safe_artifact_text(args.display_name, 180) or path.name
@@ -793,7 +853,7 @@ def make_directory(
 ) -> dict[str, Any]:
     args = _as(arguments, MakeDirectoryArguments)
     workspace = _Workspace(context)
-    path = workspace.resolve(args.path)
+    path = workspace.resolve(args.path, allowed_roots=_TASK_WRITABLE_ROOTS)
     existed = path.exists()
     if existed:
         workspace.require_directory(path)
@@ -826,7 +886,7 @@ def delete_file(
 ) -> dict[str, Any]:
     args = _as(arguments, DeleteFileArguments)
     workspace = _Workspace(context)
-    path = workspace.resolve(args.path)
+    path = workspace.resolve(args.path, allowed_roots=_TASK_WRITABLE_ROOTS)
     metadata = workspace.require_file(path)
     sha256 = workspace.assert_expected_hash(path, args.expected_sha256)
     trash_id = uuid.uuid4().hex
@@ -852,8 +912,11 @@ def move_file(
 ) -> dict[str, Any]:
     args = _as(arguments, MoveFileArguments)
     workspace = _Workspace(context)
-    source = workspace.resolve(args.source_path)
-    destination = workspace.resolve(args.destination_path)
+    source = workspace.resolve(args.source_path, allowed_roots=_TASK_WRITABLE_ROOTS)
+    destination = workspace.resolve(
+        args.destination_path,
+        allowed_roots=_TASK_WRITABLE_ROOTS,
+    )
     _different_paths(source, destination)
     source_metadata = workspace.require_file(source)
     source_sha256 = workspace.assert_expected_hash(source, args.expected_sha256)
@@ -883,8 +946,11 @@ def copy_file(
 ) -> dict[str, Any]:
     args = _as(arguments, CopyFileArguments)
     workspace = _Workspace(context)
-    source = workspace.resolve(args.source_path)
-    destination = workspace.resolve(args.destination_path)
+    source = workspace.resolve(args.source_path, allowed_roots=_TASK_READABLE_ROOTS)
+    destination = workspace.resolve(
+        args.destination_path,
+        allowed_roots=_TASK_WRITABLE_ROOTS,
+    )
     _different_paths(source, destination)
     source_metadata = workspace.require_file(source)
     workspace.ensure_file_size(source_metadata.st_size)
@@ -1101,7 +1167,7 @@ def _iter_directory_entries(workspace: _Workspace, start: Path) -> Iterator[Path
         allowed_directories: list[str] = []
         for name in sorted(directory_names):
             child = base / name
-            if name == _TRASH_DIRECTORY and child == workspace.root / _TRASH_DIRECTORY:
+            if name in {_TRASH_DIRECTORY, _WORKSPACE_INTERNAL_DIRECTORY} and child.parent == workspace.root:
                 continue
             if child.is_symlink():
                 yield child

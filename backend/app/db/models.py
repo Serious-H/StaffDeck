@@ -1186,6 +1186,32 @@ class HarnessInvocationRecord(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class HarnessWorkspaceFileRecord(SQLModel, table=True):
+    """One immutable file version governed by a Harness task or chat session."""
+
+    __tablename__ = "harness_workspace_files"
+
+    id: str = Field(default_factory=lambda: new_id("hwfile"), primary_key=True)
+    tenant_id: str = Field(index=True)
+    session_id: str = Field(index=True)
+    task_frame_id: str = Field(index=True)
+    logical_path: str
+    storage_path: str
+    sha256: str = Field(index=True)
+    size: int
+    content_type: str = Field(default="application/octet-stream")
+    # source = user-uploaded original; derived = system-generated processing
+    # data; internal = reusable but not user-facing flow data; deliverable = a
+    # user-facing final result.
+    kind: str = Field(default="internal", index=True)
+    # task_frame refs are available only to their producer task; session refs
+    # are immutable files that future task frames may explicitly materialize.
+    visibility: str = Field(default="task_frame", index=True)
+    producer_invocation_id: Optional[str] = Field(default=None, index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class Message(SQLModel, table=True):
     __tablename__ = "messages"
 
