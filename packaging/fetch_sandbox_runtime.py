@@ -28,6 +28,9 @@ PACKAGE_JSON = MANIFEST_DIR / "sandbox-runtime-package.json"
 PACKAGE_LOCK = MANIFEST_DIR / "sandbox-runtime-package-lock.json"
 NODE_VERSION = os.environ.get("STAFFDECK_NODE_VERSION", "v22.14.0")
 PATCH_MARKER = "staffdeck-allow-all-domains-patch-v1"
+TASK_WORKSPACE_WRITE_OVERLAY_PATCH_MARKER = (
+    "staffdeck-task-workspace-write-overlay-patch-v1"
+)
 PATCHED_SHA256 = {
     "sandbox-config.js": "17a9bdd4cce375bb098f9c02eb564cf80806079571d4ff784e2af7d27db446bb",
     "sandbox-manager.js": "dca5176508d6ee31807e2138eea82bcbb6f6e5e40c67aff2ac9958d3bc893b4c",
@@ -88,6 +91,64 @@ def _verify_patched_dist(config_path: Path, manager_path: Path) -> None:
             raise SystemExit(f"Patched SRT dist hash mismatch: {path.name}")
 
 
+def _apply_task_workspace_write_overlay_patch(destination: Path) -> None:
+    """Preserve writable descendants after SRT re-allows a read-only parent.
+
+    StaffDeck's governed TaskFrame is read-only as a whole, with only
+    ``work/`` and ``output/`` writable.  It also lives below SRT's protected
+    application-data directory.  SRT correctly restores an allowRead parent
+    after masking that protected directory, but the later read-only bind of
+    the parent otherwise hides the earlier writable child binds.
+
+    Re-bind a writable descendant after its read-allowed ancestor.  This is a
+    narrow ordering correction; denyWrite rules are still emitted later by
+    SRT and continue to take precedence.
+    """
+
+    utils_path = (
+        destination
+        / "node_modules"
+        / "@anthropic-ai"
+        / "sandbox-runtime"
+        / "dist"
+        / "sandbox"
+        / "linux-sandbox-utils.js"
+    )
+    if not utils_path.is_file():
+        raise SystemExit("SRT bundle layout is unexpected; refusing to patch it.")
+    source = utils_path.read_text(encoding="utf-8")
+    if TASK_WORKSPACE_WRITE_OVERLAY_PATCH_MARKER in source:
+        return
+
+    function_start = source.find("function pushReadDenyDirMounts(")
+    function_end_anchor = "\n}\n/**\n * Generate filesystem bind mount arguments for bwrap\n */"
+    function_end = source.find(function_end_anchor, function_start)
+    if function_start < 0 or function_end < 0:
+        raise SystemExit("SRT workspace patch anchors changed; refusing an unverified patch.")
+    insertion = (
+        "\n"
+        f"    // {TASK_WORKSPACE_WRITE_OVERLAY_PATCH_MARKER}\n"
+        "    // An allowRead bind can restore a parent after its writable child\n"
+        "    // was bound above. Re-bind that child last so the declared write\n"
+        "    // permission remains effective while the parent stays read-only.\n"
+        "    for (const writePath of allowedWritePaths) {\n"
+        "        if ((writePath.startsWith(denySep) || writePath === normalizedPath) &&\n"
+        "            readAllowPaths.some(allowPath => writePath === allowPath || writePath.startsWith(allowPath + '/'))) {\n"
+        "            args.push('--bind', writePath, writePath);\n"
+        "            logForDebugging(`[Sandbox Linux] Re-bound writable descendant after read allow: ${writePath}`);\n"
+        "        }\n"
+        "    }\n"
+    )
+    utils_path.write_text(source[:function_end] + insertion + source[function_end:], encoding="utf-8")
+    if TASK_WORKSPACE_WRITE_OVERLAY_PATCH_MARKER not in utils_path.read_text(encoding="utf-8"):
+        raise SystemExit("SRT workspace patch verification failed.")
+
+
+def _apply_staffdeck_srt_patches(destination: Path) -> None:
+    _apply_allow_all_domains_patch(destination)
+    _apply_task_workspace_write_overlay_patch(destination)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("destination", type=Path)
@@ -111,7 +172,7 @@ def main() -> int:
         check=True,
     )
     _verify_srt_integrity(destination)
-    _apply_allow_all_domains_patch(destination)
+    _apply_staffdeck_srt_patches(destination)
     print(f"SRT runtime ready at {destination}")
     return 0
 

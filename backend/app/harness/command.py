@@ -731,14 +731,14 @@ def _write_srt_settings(
             )
         )
     allow_read = [str(workspace.resolve())]
-    runtime_root = _bundled_runtime_root()
-    if runtime_root is not None:
-        allow_read.append(str(runtime_root))
     if restrict_to_task_workspace_layout:
         layout = ensure_task_workspace_layout(workspace)
         allow_write = [str(layout.work_dir), str(layout.output_dir)]
     else:
         allow_write = ["."]
+    runtime_root = _bundled_runtime_root()
+    if runtime_root is not None:
+        allow_read.append(str(runtime_root))
     if sandbox_temp is not None:
         resolved_temp = str(sandbox_temp.resolve(strict=True))
         allow_read.append(resolved_temp)

@@ -51,3 +51,33 @@ def test_srt_lock_integrity_is_enforced(tmp_path: Path) -> None:
     (tmp_path / "package-lock.json").write_text(json.dumps(lock), encoding="utf-8")
     with pytest.raises(SystemExit, match="dependency graph"):
         fetch._verify_srt_integrity(tmp_path)
+
+
+def test_task_workspace_write_overlay_patch_is_idempotent(tmp_path: Path) -> None:
+    utils_path = (
+        tmp_path
+        / "node_modules"
+        / "@anthropic-ai"
+        / "sandbox-runtime"
+        / "dist"
+        / "sandbox"
+        / "linux-sandbox-utils.js"
+    )
+    utils_path.parent.mkdir(parents=True)
+    utils_path.write_text(
+        "function pushReadDenyDirMounts(args, normalizedPath, allowedWritePaths, readAllowPaths) {\n"
+        "    const denySep = normalizedPath + '/';\n"
+        "}\n"
+        "/**\n"
+        " * Generate filesystem bind mount arguments for bwrap\n"
+        " */\n",
+        encoding="utf-8",
+    )
+
+    fetch._apply_task_workspace_write_overlay_patch(tmp_path)
+    patched = utils_path.read_text(encoding="utf-8")
+    assert fetch.TASK_WORKSPACE_WRITE_OVERLAY_PATCH_MARKER in patched
+    assert "Re-bound writable descendant after read allow" in patched
+
+    fetch._apply_task_workspace_write_overlay_patch(tmp_path)
+    assert utils_path.read_text(encoding="utf-8") == patched

@@ -20,7 +20,7 @@ def main() -> int:
     if not node.is_file() or not cli.is_file():
         raise SystemExit("Final sandbox bundle is missing Node or the SRT CLI.")
     fetch._verify_srt_integrity(runtime)
-    fetch._apply_allow_all_domains_patch(runtime)
+    fetch._apply_staffdeck_srt_patches(runtime)
     completed = subprocess.run(
         [str(node), str(cli), "--version"],
         text=True,

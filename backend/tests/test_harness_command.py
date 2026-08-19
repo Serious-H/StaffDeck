@@ -365,7 +365,9 @@ def test_governed_srt_settings_write_only_task_work_and_output(
         str(workspace / "output"),
         str(sandbox_temp),
     ]
-    assert str(workspace) in filesystem["allowRead"]
+    # The TaskFrame is read-only as a whole.  The SRT runtime then overlays
+    # the explicitly governed work/ and output/ child directories as writable.
+    assert filesystem["allowRead"][0] == str(workspace)
 
 
 def test_governed_bubblewrap_blocks_task_root_writes_when_available(
@@ -394,6 +396,44 @@ printf blocked > /workspace/root.txt
     assert permitted_file.exists(), result.data["stderr"]
     assert permitted_file.read_text() == "permitted"
     assert not (workspace / "root.txt").exists()
+
+
+def test_governed_srt_allows_task_output_under_protected_data_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """SRT must not re-mask output/ when its parent is protected.
+
+    StaffDeck deliberately places TaskFrames under its protected user-data
+    directory.  This exercises the overlapping denyRead/allowRead/allowWrite
+    configuration that caused output/ to become unexpectedly read-only.
+    """
+
+    if not sys.platform.startswith("linux") or command_module.resolve_srt() is None:
+        pytest.skip("SRT is unavailable in this test environment.")
+    data_root = (tmp_path / "StaffDeck-data").resolve()
+    workspace = data_root / "harness_workspaces" / "task"
+    workspace.mkdir(parents=True)
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(data_root))
+    monkeypatch.setattr(command_module, "available_backend", lambda: "srt")
+
+    result = _execute(
+        tmp_path,
+        {
+            "command": (
+                "printf permitted > output/permitted.txt\n"
+                "printf forbidden > root-must-not-be-writable.txt"
+            )
+        },
+        workspace_root=workspace,
+        sandbox_network_mode="deny",
+        enforce_task_workspace_layout=True,
+    )
+
+    assert result.success is True
+    assert result.data is not None
+    assert result.data["status"] == "failed", result.data["stderr"]
+    assert (workspace / "output" / "permitted.txt").read_text() == "permitted"
+    assert not (workspace / "root-must-not-be-writable.txt").exists()
 
 
 def test_srt_all_network_requires_reviewed_runtime_patch(
@@ -805,12 +845,15 @@ def _execute(
     *,
     limits: HarnessLimits | None = None,
     enforce_task_workspace_layout: bool = False,
+    workspace_root: Path | None = None,
+    sandbox_network_mode: str = "all",
 ):
     context = HarnessToolContext(
         run_id="run",
         task_frame_id="frame",
-        workspace_root=(tmp_path / "workspace").resolve(),
+        workspace_root=(workspace_root or tmp_path / "workspace").resolve(),
         limits=limits or HarnessLimits(),
+        sandbox_network_mode=sandbox_network_mode,
         enforce_task_workspace_layout=enforce_task_workspace_layout,
     )
     return HarnessExecutor(build_command_tool_registry()).execute(
