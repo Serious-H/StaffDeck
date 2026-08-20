@@ -208,6 +208,17 @@ type GeneralSkillFile = {
   mime_type?: string;
 };
 
+type GeneralSkillPackagePreview = {
+  filename: string;
+  name: string;
+  slug: string;
+  description?: string;
+  homepage?: string;
+  skill_markdown: string;
+  skill_files: GeneralSkillFile[];
+  skill_directories: string[];
+};
+
 type SkillFileTreeNode =
   | { kind: 'folder'; name: string; path: string; children: SkillFileTreeNode[] }
   | { kind: 'file'; name: string; path: string; file: GeneralSkillFile };
@@ -362,6 +373,8 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [agentScopeLoaded, setAgentScopeLoaded] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<GeneralSkillRead | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [permanentDeleteTarget, setPermanentDeleteTarget] = useState<GeneralSkillRead | null>(null);
+  const [permanentlyDeleting, setPermanentlyDeleting] = useState(false);
 
   const pageTitle = isOverallAgent ? '技能广场' : '技能';
   const listLabel = isOverallAgent ? '技能广场列表' : '技能列表';
@@ -492,6 +505,24 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
     }
   }
 
+  async function confirmPermanentDeleteSkill() {
+    const row = permanentDeleteTarget;
+    if (!row || !agentId) return;
+    setPermanentlyDeleting(true);
+    try {
+      await api.delete(
+        `/api/enterprise/general-skills/${encodeURIComponent(row.slug)}/permanent?tenant_id=${TENANT_ID}&agent_id=${encodeURIComponent(agentId)}`,
+      );
+      setRows((current) => current.filter((item) => item.id !== row.id));
+      notify.success('已彻底删除技能，Slug 已释放');
+      setPermanentDeleteTarget(null);
+    } catch (error) {
+      notify.error(error instanceof Error ? error.message : '彻底删除失败');
+    } finally {
+      setPermanentlyDeleting(false);
+    }
+  }
+
   function requestClawHubImport() {
     clawhubAbortRef.current?.abort();
     clawhubAbortRef.current = null;
@@ -617,6 +648,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
 
   function renderActions(row: GeneralSkillRead) {
     const published = row.status === 'published';
+    const canPermanentlyDelete = !isOverallAgent && Boolean(row.can_permanent_delete);
     if (isOverallAgent && !canManageCurrentScope) {
       return null;
     }
@@ -662,6 +694,16 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
             <IconTrash />
             {isOverallAgent ? '删除' : '移除'}
           </DropdownMenuItem>
+          {canPermanentlyDelete && (
+            <DropdownMenuItem
+              variant="destructive"
+              className={MENU_ITEM_DANGER_CLASS}
+              onSelect={() => setPermanentDeleteTarget(row)}
+            >
+              <IconTrash />
+              彻底删除
+            </DropdownMenuItem>
+          )}
         </DropdownMenuContent>
       </DropdownMenu>
     );
@@ -958,6 +1000,15 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         }
         confirmText={isOverallAgent ? '删除' : '移除'}
         onConfirm={() => void confirmDeleteSkill()}
+      />
+      <ConfirmDialog
+        open={Boolean(permanentDeleteTarget)}
+        onOpenChange={(open) => !open && setPermanentDeleteTarget(null)}
+        loading={permanentlyDeleting}
+        title={permanentDeleteTarget ? `彻底删除技能「${permanentDeleteTarget.name}」？` : ''}
+        description="这会永久删除该私有技能及其文件包，并释放 Slug。已被其他数字员工、广场或 SOP 引用的技能不能彻底删除。此操作不可恢复。"
+        confirmText="彻底删除"
+        onConfirm={() => void confirmPermanentDeleteSkill()}
       />
     </div>
   );
@@ -1427,6 +1478,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   const [skillSlug, setSkillSlug] = useState('');
   const [skillDescription, setSkillDescription] = useState('');
   const [skillHomepage, setSkillHomepage] = useState('');
+  const [skillStatus, setSkillStatus] = useState<GeneralSkillRead['status']>('draft');
   const [capabilityScope, setCapabilityScope] = useState<CapabilityScope>('general');
   const [skillFiles, setSkillFiles] = useState<GeneralSkillFile[]>([
     { path: 'SKILL.md', content: EMPTY_SKILL_MARKDOWN, size: EMPTY_SKILL_MARKDOWN.length, mime_type: 'text/markdown' },
@@ -1670,10 +1722,10 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         markdown,
         files: skillFiles.length ? skillFiles : [{ path: 'SKILL.md', content: markdown }],
         directories: skillDirectories,
-        status: 'published',
+        status: skillStatus,
         original_slug: editingSlug || undefined,
       });
-      notify.success(editingSlug ? `已保存 ${row.name}` : `已新增 ${row.name}`);
+      notify.success(editingSlug ? `已保存 ${row.name}` : `已保存草稿 ${row.name}`);
       setSelectedSlug(row.slug);
       setEditingSlug(row.slug);
       setMarkdown(row.skill_markdown);
@@ -1681,6 +1733,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       setSkillSlug(row.slug);
       setSkillDescription(row.description || '');
       setSkillHomepage(row.homepage || '');
+      setSkillStatus(row.status);
       setCapabilityScope(normalizeCapabilityScope(row.capability_scope));
       setSkillFiles(row.skill_files?.length ? row.skill_files : [{ path: 'SKILL.md', content: row.skill_markdown }]);
       setSkillDirectories(row.skill_directories || []);
@@ -1694,7 +1747,12 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       navigate(`/enterprise/general-skills/${encodeURIComponent(row.slug)}/edit${scopeQuery}`, { replace: !editingSlug });
       return row;
     } catch (error) {
-      notify.error(error instanceof Error ? error.message : '保存技能失败');
+      const message = error instanceof Error ? error.message : '保存技能失败';
+      notify.error(
+        message.includes('General skill slug already exists')
+          ? `技能标识「${skillSlug.trim() || '未填写'}」已被使用。若要更新该技能，请进入其编辑页并导入同一标识的技能包；若要创建新技能，请填写新的技能标识。`
+          : message,
+      );
       return null;
     } finally {
       setSaving(false);
@@ -1707,6 +1765,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     setSkillSlug('');
     setSkillDescription('');
     setSkillHomepage('');
+    setSkillStatus('draft');
     setCapabilityScope('general');
     setSkillFiles([{ path: 'SKILL.md', content: EMPTY_SKILL_MARKDOWN, size: EMPTY_SKILL_MARKDOWN.length, mime_type: 'text/markdown' }]);
     setSkillDirectories([]);
@@ -1727,6 +1786,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     setSkillSlug(row.slug);
     setSkillDescription(row.description || '');
     setSkillHomepage(row.homepage || '');
+    setSkillStatus(row.status);
     setCapabilityScope(normalizeCapabilityScope(row.capability_scope));
     setSkillFiles(row.skill_files?.length ? row.skill_files : [{ path: 'SKILL.md', content: row.skill_markdown }]);
     setSkillDirectories(row.skill_directories || []);
@@ -1747,6 +1807,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       setSkillSlug(row.slug);
       setSkillDescription(row.description || '');
       setSkillHomepage(row.homepage || '');
+      setSkillStatus(row.status);
       setCapabilityScope(normalizeCapabilityScope(row.capability_scope));
       setMarkdown(row.skill_markdown);
       setSkillFiles(row.skill_files?.length ? row.skill_files : [{ path: 'SKILL.md', content: row.skill_markdown }]);
@@ -1978,20 +2039,34 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     try {
       const contentBase64 = await fileToBase64(file);
       if (controller.signal.aborted) return;
-      const row = await api.postWithSignal<GeneralSkillRead>('/api/enterprise/general-skills/import-package', {
+      const preview = await api.postWithSignal<GeneralSkillPackagePreview>('/api/enterprise/general-skills/preview-package', {
         tenant_id: TENANT_ID,
-        agent_id: !isOverallAgent && agentId ? agentId : undefined,
         filename: file.name,
         content_base64: contentBase64,
-        status: 'published',
       }, controller.signal);
       if (controller.signal.aborted) return;
-      notify.success(`已上传 ${row.name}`);
-      setRows((current) => [row, ...current.filter((item) => item.id !== row.id && item.slug !== row.slug)]);
-      setSelectedSlug(row.slug);
-      editSkill(row);
-      setClawhubModalOpen(false);
-      void load();
+      const updatingExisting = Boolean(editingSlug && preview.slug === editingSlug);
+      if (!updatingExisting) {
+        startImportedDraft();
+      }
+      setSkillName(preview.name);
+      setSkillSlug(preview.slug);
+      setSkillDescription(preview.description || '');
+      setSkillHomepage(preview.homepage || '');
+      if (!updatingExisting) {
+        setSkillStatus('draft');
+      }
+      setMarkdown(preview.skill_markdown);
+      setSkillFiles(preview.skill_files);
+      setSkillDirectories(preview.skill_directories || []);
+      const entrypoint = preview.skill_files.find((item) => item.path.split('/').pop()?.toLowerCase() === 'skill.md');
+      setSelectedFilePath(entrypoint?.path || preview.skill_files[0]?.path || 'SKILL.md');
+      setSelectedFolderPath(null);
+      notify.success(
+        updatingExisting
+          ? `已载入 ${preview.filename}；保存后将更新技能「${editingSlug}」。`
+          : `已解析 ${preview.filename}；请确认名称、技能标识和文件内容后保存草稿。`,
+      );
     } catch (error) {
       if (isAbortError(error)) {
         notify.info('已取消导入');
@@ -2527,7 +2602,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         {importMenu}
         {canManageCurrentScope && (
           <UIButton disabled={saving} className={PRIMARY_BUTTON_CLASS} onClick={() => void importSkill()}>
-            保存
+            {editingSlug ? '保存' : '保存草稿'}
           </UIButton>
         )}
       </div>

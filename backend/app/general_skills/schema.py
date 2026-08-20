@@ -50,8 +50,27 @@ class GeneralSkillPackageUploadRequest(BaseModel):
     slug: Optional[str] = None
     description: Optional[str] = None
     homepage: Optional[str] = None
-    status: str = "published"
+    status: str = "draft"
     capability_scope: CapabilityScope = "general"
+
+
+class GeneralSkillPackagePreviewRequest(BaseModel):
+    """A package parse request that deliberately has no persistence side effect."""
+
+    tenant_id: str
+    filename: str
+    content_base64: str
+
+
+class GeneralSkillPackagePreview(BaseModel):
+    filename: str
+    name: str
+    slug: str
+    description: Optional[str] = None
+    homepage: Optional[str] = None
+    skill_markdown: str
+    skill_files: list[GeneralSkillFile] = Field(default_factory=list)
+    skill_directories: list[str] = Field(default_factory=list)
 
 
 class GeneralSkillRead(BaseModel):
@@ -69,6 +88,7 @@ class GeneralSkillRead(BaseModel):
     capability_scope: CapabilityScope
     permissions: dict[str, Any] = Field(default_factory=dict)
     runtime_config: dict[str, Any] = Field(default_factory=dict)
+    can_permanent_delete: bool = False
     created_at: str
     updated_at: str
 

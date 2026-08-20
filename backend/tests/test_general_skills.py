@@ -21,6 +21,8 @@ from app.api.general_skills import (
     import_general_skill,
     import_general_skill_package,
     list_general_skills,
+    permanently_delete_private_general_skill,
+    preview_general_skill_package,
     publish_general_skill,
     publish_general_skill_to_gallery,
     run_general_skill,
@@ -47,6 +49,7 @@ from app.general_skills.runner import (
 from app.general_skills.schema import (
     GeneralSkillClawHubImportRequest,
     GeneralSkillImportRequest,
+    GeneralSkillPackagePreviewRequest,
     GeneralSkillPackageUploadRequest,
     GeneralSkillRunRequest,
     GeneralSkillRunResponse,
@@ -692,6 +695,208 @@ def test_import_general_skill_package_upload_keeps_full_zip_folder() -> None:
             "assets/config.json",
         ]
         assert row.skill_markdown.startswith("---\nname: Nuwa Skill")
+
+
+def test_preview_general_skill_package_does_not_create_a_database_row() -> None:
+    markdown = (
+        "---\nname: 预览技能\nslug: preview-skill\ndescription: 仅解析不保存\n---\n\n# 技能\n"
+    )
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        preview = preview_general_skill_package(
+            GeneralSkillPackagePreviewRequest(
+                tenant_id="tenant_demo",
+                filename="preview.md",
+                content_base64=base64.b64encode(markdown.encode("utf-8")).decode("ascii"),
+            ),
+            db,
+        )
+
+        assert preview.name == "预览技能"
+        assert preview.slug == "preview-skill"
+        assert [file.path for file in preview.skill_files] == ["SKILL.md"]
+        assert db.exec(select(GeneralSkill)).all() == []
+
+
+def test_direct_package_upload_reports_slug_conflict_instead_of_creating_a_suffix() -> None:
+    markdown = "---\nname: 重名技能\nslug: duplicate-skill\n---\n\n# 技能\n"
+    request = GeneralSkillPackageUploadRequest(
+        tenant_id="tenant_demo",
+        filename="duplicate.md",
+        content_base64=base64.b64encode(markdown.encode("utf-8")).decode("ascii"),
+    )
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.commit()
+        first = import_general_skill_package(request, db, _admin_user())
+        assert first.slug == "duplicate-skill"
+        assert first.status == "draft"
+
+        with pytest.raises(HTTPException) as error:
+            import_general_skill_package(request, db, _admin_user())
+
+        assert error.value.status_code == 409
+        assert [row.slug for row in db.exec(select(GeneralSkill)).all()] == ["duplicate-skill"]
+
+
+def test_package_reimport_restores_removed_private_skill_without_a_suffix() -> None:
+    first_markdown = "---\nname: 私有上传技能\nslug: private-upload-skill\n---\n\n# 初始版本\n"
+    updated_markdown = first_markdown.replace("初始版本", "更新版本")
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_branch", tenant_id="tenant_demo", name="研发员工", is_overall=False
+            )
+        )
+        db.commit()
+
+        imported = import_general_skill_package(
+            GeneralSkillPackageUploadRequest(
+                tenant_id="tenant_demo",
+                agent_id="agent_branch",
+                filename="private-skill.md",
+                content_base64=base64.b64encode(first_markdown.encode("utf-8")).decode("ascii"),
+            ),
+            db,
+            _admin_user(),
+        )
+        delete_general_skill(
+            imported.slug,
+            "tenant_demo",
+            db,
+            agent_id="agent_branch",
+            current_user=_admin_user(),
+        )
+        restored = import_general_skill_package(
+            GeneralSkillPackageUploadRequest(
+                tenant_id="tenant_demo",
+                agent_id="agent_branch",
+                filename="private-skill.md",
+                content_base64=base64.b64encode(updated_markdown.encode("utf-8")).decode("ascii"),
+            ),
+            db,
+            _admin_user(),
+        )
+
+        assert restored.id == imported.id
+        assert restored.slug == "private-upload-skill"
+        assert restored.skill_markdown.rstrip().endswith("# 更新版本")
+        rows = list_general_skills("tenant_demo", db, agent_id="agent_branch")
+        assert [(row.id, row.status) for row in rows] == [(imported.id, "draft")]
+
+
+def test_permanently_delete_private_skill_releases_slug() -> None:
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_owner", tenant_id="tenant_demo", name="技能所有者", is_overall=False
+            )
+        )
+        db.commit()
+        imported = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                agent_id="agent_owner",
+                name="私有技能",
+                slug="permanent-private-skill",
+                markdown="# 私有技能\n",
+                status="draft",
+            ),
+            db,
+            _admin_user(),
+        )
+
+        deleted = permanently_delete_private_general_skill(
+            imported.slug,
+            "tenant_demo",
+            "agent_owner",
+            db,
+            _admin_user(),
+        )
+
+        assert deleted == {"status": "deleted", "slug": "permanent-private-skill"}
+        assert db.get(GeneralSkill, imported.id) is None
+        recreated = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                agent_id="agent_owner",
+                name="重建技能",
+                slug="permanent-private-skill",
+                markdown="# 重建\n",
+                status="draft",
+            ),
+            db,
+            _admin_user(),
+        )
+        assert recreated.id != imported.id
+
+
+def test_permanent_delete_rejects_private_skill_referenced_by_a_sop() -> None:
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_owner", tenant_id="tenant_demo", name="技能所有者", is_overall=False
+            )
+        )
+        db.commit()
+        imported = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                agent_id="agent_owner",
+                name="被 SOP 引用的私有技能",
+                slug="sop-referenced-private-skill",
+                markdown="# 私有技能\n",
+                status="draft",
+            ),
+            db,
+            _admin_user(),
+        )
+        db.add(
+            Skill(
+                tenant_id="tenant_demo",
+                skill_id="sop-uses-general-skill",
+                name="引用技能的 SOP",
+                content_json={
+                    "nodes": [{"capability_refs": {"general_skill_ids": [imported.id]}}]
+                },
+            )
+        )
+        db.commit()
+
+        with pytest.raises(HTTPException) as error:
+            permanently_delete_private_general_skill(
+                imported.slug,
+                "tenant_demo",
+                "agent_owner",
+                db,
+                _admin_user(),
+            )
+
+        assert error.value.status_code == 409
+        assert db.get(GeneralSkill, imported.id) is not None
 
 
 def test_import_general_skill_package_upload_treats_single_markdown_as_skill_md() -> None:

@@ -47,6 +47,7 @@ from app.db.models import (
     GeneralSkill,
     Message,
     ModelConfig,
+    Skill,
     User,
     new_id,
     utc_now,
@@ -54,6 +55,8 @@ from app.db.models import (
 from app.general_skills import (
     GeneralSkillClawHubImportRequest,
     GeneralSkillImportRequest,
+    GeneralSkillPackagePreview,
+    GeneralSkillPackagePreviewRequest,
     GeneralSkillPackageUploadRequest,
     GeneralSkillRead,
     GeneralSkillRunRequest,
@@ -95,7 +98,12 @@ def _agent_id_or_none(agent_id: object | None) -> str | None:
     return agent_id if isinstance(agent_id, str) and agent_id else None
 
 
-def general_skill_read(row: GeneralSkill, status_override: str | None = None) -> GeneralSkillRead:
+def general_skill_read(
+    row: GeneralSkill,
+    status_override: str | None = None,
+    *,
+    can_permanent_delete: bool = False,
+) -> GeneralSkillRead:
     return GeneralSkillRead(
         id=row.id,
         tenant_id=row.tenant_id,
@@ -113,6 +121,7 @@ def general_skill_read(row: GeneralSkill, status_override: str | None = None) ->
         capability_scope=normalize_capability_scope(row.capability_scope),
         permissions=row.permissions_json or {},
         runtime_config=row.runtime_config_json or {},
+        can_permanent_delete=can_permanent_delete,
         created_at=row.created_at.isoformat(),
         updated_at=row.updated_at.isoformat(),
     )
@@ -169,8 +178,7 @@ def import_general_skill(
             raise HTTPException(status_code=400, detail="General skill slug cannot be modified")
         if is_private_agent_scope:
             if is_open_gallery_resource(db, request.tenant_id, "general_skill", row):
-                row = None
-                slug = _unique_slug(db, request.tenant_id, slug)
+                raise HTTPException(status_code=409, detail="General skill slug already exists")
             elif not _general_skill_editable_by_agent(db, request.tenant_id, agent.id, row):
                 raise HTTPException(
                     status_code=404, detail="General skill not visible to this agent"
@@ -189,8 +197,8 @@ def import_general_skill(
                 "general_skill",
                 conflict,
             ):
-                slug = _unique_slug(db, request.tenant_id, slug)
-            elif is_private_agent_scope and _private_skill_owned_by_agent(
+                raise HTTPException(status_code=409, detail="General skill slug already exists")
+            elif is_private_agent_scope and _private_skill_removed_from_agent(
                 db, request.tenant_id, conflict, agent.id
             ):
                 # A private skill removed from this agent keeps its entity so
@@ -224,7 +232,7 @@ def import_general_skill(
                     "general_skill",
                     conflict,
                 ):
-                    slug = _unique_slug(db, request.tenant_id, slug)
+                    raise HTTPException(status_code=409, detail="General skill slug already exists")
                 else:
                     raise HTTPException(status_code=409, detail="General skill slug already exists")
         row.slug = slug
@@ -331,25 +339,7 @@ def import_general_skill_package(
     current_user: User = Depends(get_current_user),
 ) -> GeneralSkillRead:
     ensure_tenant(db, request.tenant_id)
-    filename = _clean_source_filename(request.filename)
-    data = _decode_base64_payload(request.content_base64)
-    if filename.lower().endswith(".zip"):
-        raw_files = _files_from_zip(data)
-    elif filename.lower().endswith((".md", ".markdown", ".txt")):
-        text = _decode_text(data)
-        raw_files = [
-            GeneralSkillFile(
-                path="SKILL.md",
-                content=text,
-                size=len(data),
-                mime_type=_guess_mime_type(filename),
-            )
-        ]
-    else:
-        raise HTTPException(
-            status_code=400, detail="Uploaded skill package must be a .zip or Markdown file"
-        )
-    files = _normalize_skill_files(raw_files, None)
+    filename, files = _parse_general_skill_package(request.filename, request.content_base64)
     return _create_imported_general_skill(
         db,
         tenant_id=request.tenant_id,
@@ -363,7 +353,57 @@ def import_general_skill_package(
         homepage=request.homepage,
         capability_scope=request.capability_scope,
         current_user=current_user,
+        conflict_policy="restore_private_or_error",
     )
+
+
+@router.post("/preview-package", response_model=GeneralSkillPackagePreview)
+def preview_general_skill_package(
+    request: GeneralSkillPackagePreviewRequest,
+    db: Session = Depends(get_session),
+) -> GeneralSkillPackagePreview:
+    """Parse an uploaded package without creating a GeneralSkill row."""
+    ensure_tenant(db, request.tenant_id)
+    filename, files = _parse_general_skill_package(request.filename, request.content_base64)
+    import_source = f"upload:{filename}"
+    markdown = _skill_markdown_from_files(files)
+    metadata = _parse_skill_metadata(markdown)
+    name = _metadata_text(metadata, "name", "title") or _source_name(import_source)
+    slug = _metadata_text(metadata, "slug", "id") or _slugify(name)
+    _validate_slug(slug)
+    return GeneralSkillPackagePreview(
+        filename=filename,
+        name=name,
+        slug=slug,
+        description=_metadata_text(metadata, "description", "summary"),
+        homepage=_metadata_text(metadata, "homepage", "url", "source"),
+        skill_markdown=markdown,
+        skill_files=files,
+        skill_directories=[],
+    )
+
+
+def _parse_general_skill_package(
+    filename_value: str, content_base64: str
+) -> tuple[str, list[GeneralSkillFile]]:
+    filename = _clean_source_filename(filename_value)
+    data = _decode_base64_payload(content_base64)
+    if filename.lower().endswith(".zip"):
+        raw_files = _files_from_zip(data)
+    elif filename.lower().endswith((".md", ".markdown", ".txt")):
+        raw_files = [
+            GeneralSkillFile(
+                path="SKILL.md",
+                content=_decode_text(data),
+                size=len(data),
+                mime_type=_guess_mime_type(filename),
+            )
+        ]
+    else:
+        raise HTTPException(
+            status_code=400, detail="Uploaded skill package must be a .zip or Markdown file"
+        )
+    return filename, _normalize_skill_files(raw_files, None)
 
 
 def _create_imported_general_skill(
@@ -380,6 +420,7 @@ def _create_imported_general_skill(
     homepage: str | None = None,
     capability_scope: str = "general",
     current_user: object | None = None,
+    conflict_policy: str = "unique_suffix",
 ) -> GeneralSkillRead:
     markdown = _skill_markdown_from_files(files)
     metadata = _parse_skill_metadata(markdown)
@@ -395,7 +436,7 @@ def _create_imported_general_skill(
         or source_slug
         or _slugify(resolved_name)
     )
-    resolved_slug = _unique_slug(db, tenant_id, slug_base)
+    resolved_slug = _slugify(slug_base)
     resolved_description = _optional_text(description) or _metadata_text(
         metadata, "description", "summary"
     )
@@ -405,36 +446,64 @@ def _create_imported_general_skill(
         or _clawhub_homepage_from_source(import_source)
     )
     _validate_slug(resolved_slug)
-    now = utc_now()
     resolved_agent_id = _agent_id_or_none(agent_id)
     agent = ensure_agent_scope_manager(db, tenant_id, resolved_agent_id, current_user)
-    row = GeneralSkill(
-        tenant_id=tenant_id,
-        slug=resolved_slug,
-        name=resolved_name,
-        description=resolved_description,
-        homepage=resolved_homepage,
-        skill_markdown=markdown,
-        skill_files_json=[file.model_dump(mode="json") for file in files],
-        metadata_json=user_creator_metadata(
-            current_user, {**metadata, "import_source": import_source}
-        ),
-        status=status,
-        capability_scope=normalize_capability_scope(capability_scope),
-        permissions_json={"network": True, "python": True},
-        runtime_config_json={"runtime": "python", "timeout_seconds": 12},
-        created_at=now,
-        updated_at=now,
-    )
-    if not (agent and not agent.is_overall):
+    is_private_agent_scope = bool(agent and not agent.is_overall)
+    if not is_private_agent_scope:
         ensure_open_gallery_admin(tenant_id, current_user)
-    if agent and not agent.is_overall:
+    existing = db.exec(
+        select(GeneralSkill).where(
+            GeneralSkill.tenant_id == tenant_id,
+            GeneralSkill.slug == resolved_slug,
+        )
+    ).first()
+    if existing and conflict_policy == "unique_suffix":
+        resolved_slug = _unique_slug(db, tenant_id, resolved_slug)
+        existing = None
+
+    import_metadata = {**metadata, "import_source": import_source}
+    now = utc_now()
+    if existing:
+        if not (
+            conflict_policy == "restore_private_or_error"
+            and is_private_agent_scope
+            and _private_skill_removed_from_agent(db, tenant_id, existing, agent.id)
+        ):
+            raise HTTPException(status_code=409, detail="General skill slug already exists")
+        row = existing
+        row.name = resolved_name
+        row.description = resolved_description
+        row.homepage = resolved_homepage
+        row.skill_markdown = markdown
+        row.skill_files_json = [file.model_dump(mode="json") for file in files]
+        row.metadata_json = metadata_preserving_creator(row.metadata_json, import_metadata)
+        row.status = status
+        row.capability_scope = normalize_capability_scope(capability_scope)
+        row.updated_at = now
+    else:
+        row = GeneralSkill(
+            tenant_id=tenant_id,
+            slug=resolved_slug,
+            name=resolved_name,
+            description=resolved_description,
+            homepage=resolved_homepage,
+            skill_markdown=markdown,
+            skill_files_json=[file.model_dump(mode="json") for file in files],
+            metadata_json=user_creator_metadata(current_user, import_metadata),
+            status=status,
+            capability_scope=normalize_capability_scope(capability_scope),
+            permissions_json={"network": True, "python": True},
+            runtime_config_json={"runtime": "python", "timeout_seconds": 12},
+            created_at=now,
+            updated_at=now,
+        )
+    if is_private_agent_scope:
         mark_resource_private_for_agent(row, agent.id, row.metadata_json or {})
     else:
         mark_resource_open_gallery(row, row.metadata_json or {})
     db.add(row)
     db.flush()
-    if agent and not agent.is_overall:
+    if is_private_agent_scope:
         ensure_private_resource_binding(
             db,
             tenant_id,
@@ -443,6 +512,7 @@ def _create_imported_general_skill(
             row.id,
             "active" if status == "published" else "inactive",
             metadata_json=row.metadata_json or {},
+            revive=True,
         )
     else:
         ensure_open_gallery_binding(
@@ -505,7 +575,12 @@ def list_general_skills(
                     status_override=(
                         "published"
                         if binding.status == "active" and row.status == "published"
+                        else "draft"
+                        if row.status == "draft"
                         else "archived"
+                    ),
+                    can_permanent_delete=_can_permanently_delete_private_general_skill(
+                        db, tenant_id, row, agent
                     ),
                 )
             )
@@ -670,6 +745,38 @@ def delete_general_skill(
 
     require_overall_agent(db, tenant_id, agent_id)
     ensure_open_gallery_admin(tenant_id, current_user)
+    db.delete(row)
+    db.commit()
+    return {"status": "deleted", "slug": slug}
+
+
+@router.delete("/{slug}/permanent")
+def permanently_delete_private_general_skill(
+    slug: str,
+    tenant_id: str = Query(...),
+    agent_id: str = Query(...),
+    db: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    """Remove an unshared, private package and release its slug permanently."""
+    row = _get_general_skill(db, tenant_id, slug)
+    agent = ensure_agent_scope_manager(db, tenant_id, _agent_id_or_none(agent_id), current_user)
+    bindings = db.exec(
+        select(AgentResourceBinding).where(
+            AgentResourceBinding.tenant_id == tenant_id,
+            AgentResourceBinding.resource_type == "general_skill",
+            AgentResourceBinding.resource_id == row.id,
+        )
+    ).all()
+    if not _can_permanently_delete_private_general_skill(
+        db, tenant_id, row, agent, bindings
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="General skill is shared, referenced by a SOP, or is not owned by this employee",
+        )
+    for binding in bindings:
+        db.delete(binding)
     db.delete(row)
     db.commit()
     return {"status": "deleted", "slug": slug}
@@ -964,6 +1071,75 @@ def _private_skill_owned_by_agent(
         )
     ).first()
     return bool(binding and (binding.metadata_json or {}).get("scope") == "agent_private")
+
+
+def _private_skill_removed_from_agent(
+    db: Session, tenant_id: str, row: GeneralSkill, agent_id: str
+) -> bool:
+    if not _private_skill_owned_by_agent(db, tenant_id, row, agent_id):
+        return False
+    binding = db.exec(
+        select(AgentResourceBinding).where(
+            AgentResourceBinding.tenant_id == tenant_id,
+            AgentResourceBinding.agent_id == agent_id,
+            AgentResourceBinding.resource_type == "general_skill",
+            AgentResourceBinding.resource_id == row.id,
+        )
+    ).first()
+    return bool(binding and binding.status == "deleted")
+
+
+def _skill_card_references_general_skill(content: object, general_skill_id: str) -> bool:
+    if not isinstance(content, dict):
+        return False
+    nodes = content.get("nodes")
+    if not isinstance(nodes, list):
+        return False
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        refs = node.get("capability_refs")
+        if not isinstance(refs, dict):
+            continue
+        for key in ("general_skill_ids", "required_general_skill_ids"):
+            values = refs.get(key)
+            if isinstance(values, list) and general_skill_id in values:
+                return True
+    return False
+
+
+def _has_sop_reference_to_general_skill(
+    db: Session, tenant_id: str, general_skill_id: str
+) -> bool:
+    skills = db.exec(select(Skill).where(Skill.tenant_id == tenant_id)).all()
+    return any(
+        _skill_card_references_general_skill(skill.content_json, general_skill_id)
+        for skill in skills
+    )
+
+
+def _can_permanently_delete_private_general_skill(
+    db: Session,
+    tenant_id: str,
+    row: GeneralSkill,
+    agent: object | None,
+    bindings: list[AgentResourceBinding] | None = None,
+) -> bool:
+    if not agent or bool(getattr(agent, "is_overall", False)):
+        return False
+    agent_id = str(getattr(agent, "id", "") or "")
+    if not agent_id or not _private_skill_owned_by_agent(db, tenant_id, row, agent_id):
+        return False
+    bindings = bindings or db.exec(
+        select(AgentResourceBinding).where(
+            AgentResourceBinding.tenant_id == tenant_id,
+            AgentResourceBinding.resource_type == "general_skill",
+            AgentResourceBinding.resource_id == row.id,
+        )
+    ).all()
+    if any(binding.agent_id != agent_id and binding.status != "deleted" for binding in bindings):
+        return False
+    return not _has_sop_reference_to_general_skill(db, tenant_id, row.id)
 
 
 def _ensure_general_skill_visible(

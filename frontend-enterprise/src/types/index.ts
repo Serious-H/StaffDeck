@@ -307,6 +307,7 @@ export type GeneralSkillRead = {
   status: 'draft' | 'published' | 'archived';
   permissions: Record<string, unknown>;
   runtime_config: Record<string, unknown>;
+  can_permanent_delete?: boolean;
   created_at: string;
   updated_at: string;
 };
