@@ -2746,6 +2746,10 @@ def test_harness_agent_enforces_tool_allowlist_and_keeps_an_isolated_transcript(
     assert "GeneralSkill 是工作流说明包" in system_prompts[0]
     assert "不会启动第二套 runner" in system_prompts[0]
     assert "Skill 负责提供工作流程" in system_prompts[0]
+    assert "最终文件必须明确写到 `/workspace/output/<文件名>`" in system_prompts[0]
+    assert "不得根据当前目录、`os.getcwd()` 或宿主机路径推导" in system_prompts[0]
+    assert "`sandbox_path` 直接作为 `exec_command` 中脚本的" in system_prompts[0]
+    assert "不得对其调用 `copy_file`、" in system_prompts[0]
 
 
 def test_harness_agent_adapts_bare_json_after_loading_general_skill(
@@ -2883,6 +2887,184 @@ def test_harness_agent_does_not_adapt_bare_json_without_loaded_general_skill(
     assert result.error is not None
     assert result.error["code"] == "HARNESS_ACTION_INVALID"
     assert result.structured_result is None
+
+
+def test_harness_agent_repairs_one_invalid_action_without_repeating_tool(
+    monkeypatch,
+) -> None:
+    actions = iter(
+        [
+            {
+                "action": "tool",
+                "tool_name": "publish_artifact",
+                "arguments": {"path": "/workspace/output/result.md"},
+            },
+            {"action": "complete"},
+            {
+                "action": "finish",
+                "status": "completed",
+                "reply_fragment": "已生成 result.md。",
+                "task_summary": "文件转换完成。",
+            },
+        ]
+    )
+    payloads: list[dict[str, object]] = []
+
+    class FakeLLMClient:
+        def __init__(self, _model_config: ModelConfig):
+            pass
+
+        def generate_json(self, _system_prompt, payload):
+            payloads.append(deepcopy(payload))
+            return next(actions)
+
+    monkeypatch.setattr(harness_agent_module, "LLMClient", FakeLLMClient)
+    invoked: list[str] = []
+    trace_events: list[tuple[str, dict[str, object]]] = []
+
+    def invoke_tool(name: str, _arguments: dict[str, object]) -> dict[str, object]:
+        invoked.append(name)
+        return {
+            "success": True,
+            "data": {"path": "/workspace/output/result.md"},
+            "artifacts": [
+                {
+                    "path": "output/result.md",
+                    "display_name": "result.md",
+                    "operation": "publish_artifact",
+                }
+            ],
+        }
+
+    result = HarnessTaskAgent().run(
+        TaskRequirement(
+            task_frame_id="task-action-repair",
+            kind="conversation",
+            goal="生成一个 Markdown 文件",
+            capability_manifest=CapabilityManifest(
+                available=[
+                    CapabilityDescriptor(
+                        capability_id="builtin.publish-artifact",
+                        name="publish_artifact",
+                        kind="file",
+                    )
+                ]
+            ),
+        ),
+        _model_config(),
+        invoke_tool,
+        max_actions=2,
+        trace_sink=lambda event_type, payload: trace_events.append((event_type, payload)),
+    )
+
+    assert result.status == "completed"
+    assert result.action_count == 2
+    assert result.reply_fragment == "已生成 result.md。"
+    assert invoked == ["publish_artifact"]
+    assert len(payloads) == 3
+    assert payloads[2]["action_protocol_repair"] == {
+        "reason": "上一条模型输出不符合 HarnessAction JSON 协议。",
+        "instruction": (
+            "当前记录显示最终交付物已经发布。不得调用、重试或假定任何工具；"
+            "仅依据当前任务和已记录的工具结果，输出一个合法的 action=finish JSON。"
+        ),
+    }
+    assert any(
+        event_type == "harness_action_repairing"
+        for event_type, _payload in trace_events
+    )
+
+
+def test_harness_agent_keeps_published_artifact_when_action_repair_fails(
+    monkeypatch,
+) -> None:
+    actions = iter(
+        [
+            {
+                "action": "tool",
+                "tool_name": "publish_artifact",
+                "arguments": {"path": "/workspace/output/result.md"},
+            },
+            {"action": "complete"},
+            {
+                "action": "tool",
+                "tool_name": "publish_artifact",
+                "arguments": {"path": "/workspace/output/result.md"},
+            },
+        ]
+    )
+
+    class FakeLLMClient:
+        def __init__(self, _model_config: ModelConfig):
+            pass
+
+        def generate_json(self, _system_prompt, _payload):
+            return next(actions)
+
+    monkeypatch.setattr(harness_agent_module, "LLMClient", FakeLLMClient)
+    invoked: list[str] = []
+
+    def invoke_tool(name: str, _arguments: dict[str, object]) -> dict[str, object]:
+        invoked.append(name)
+        return {
+            "success": True,
+            "data": {"path": "/workspace/output/result.md"},
+            "artifacts": [
+                {
+                    "path": "output/result.md",
+                    "display_name": "result.md",
+                    "operation": "publish_artifact",
+                }
+            ],
+        }
+
+    result = HarnessTaskAgent().run(
+        TaskRequirement(
+            task_frame_id="task-action-repair-fails",
+            kind="conversation",
+            goal="生成一个 Markdown 文件",
+            capability_manifest=CapabilityManifest(
+                available=[
+                    CapabilityDescriptor(
+                        capability_id="builtin.publish-artifact",
+                        name="publish_artifact",
+                        kind="file",
+                    )
+                ]
+            ),
+        ),
+        _model_config(),
+        invoke_tool,
+        max_actions=2,
+    )
+
+    assert result.status == "failed"
+    assert result.error is not None
+    assert result.error["code"] == "HARNESS_ACTION_INVALID"
+    assert result.error["action_protocol_repairs"] == 1
+    assert result.artifacts == [
+        {
+            "path": "output/result.md",
+            "display_name": "result.md",
+            "operation": "publish_artifact",
+        }
+    ]
+    assert result.reply_fragment == (
+        "任务收尾时模型未返回有效动作，已生成的文件仍可在本会话文件区下载：result.md。"
+    )
+    assert invoked == ["publish_artifact"]
+
+
+def test_harness_agent_protocol_repair_requires_latest_publish_result() -> None:
+    assert harness_agent_module._last_tool_was_successful_artifact_publication(
+        "publish_artifact", True
+    )
+    assert not harness_agent_module._last_tool_was_successful_artifact_publication(
+        "capability_describe", True
+    )
+    assert not harness_agent_module._last_tool_was_successful_artifact_publication(
+        "publish_artifact", False
+    )
 
 
 def test_harness_agent_blocks_repeated_non_retryable_action(

@@ -25,6 +25,7 @@ from app.session.slot_policy import strip_router_generated_message_slots
 
 PROMPT_PATH = paths.resource_dir() / "app" / "llm" / "prompts" / "harness_agent_prompt.md"
 MAX_SUCCESSFUL_KNOWLEDGE_SEARCHES_PER_TASK = 2
+MAX_ACTION_PROTOCOL_REPAIRS_PER_TASK = 1
 ToolInvoker = Callable[[str, dict[str, Any]], dict[str, Any]]
 TraceSink = Callable[[str, dict[str, Any]], None]
 CancellationCheck = Callable[[], bool]
@@ -35,6 +36,10 @@ class HarnessExecutionCancelled(RuntimeError):
 
 
 class HarnessExecutionFenced(RuntimeError):
+    pass
+
+
+class HarnessActionRepairError(RuntimeError):
     pass
 
 
@@ -76,6 +81,9 @@ class HarnessTaskAgent:
         artifacts: list[dict[str, Any]] = []
         loaded_general_skill_names: list[str] = []
         non_retryable_action_signatures: set[str] = set()
+        action_protocol_repairs = 0
+        last_tool_name: str | None = None
+        last_tool_succeeded = False
         allowed_names = requirement.capability_manifest.allowed_names()
         system_prompt = PROMPT_PATH.read_text(encoding="utf-8").strip()
 
@@ -132,24 +140,62 @@ class HarnessTaskAgent:
                         payload,
                     )
                 try:
-                    action = HarnessAction.model_validate(raw)
-                except ValidationError:
-                    action = _adapt_general_skill_structured_result(
+                    action = _parse_harness_action(
                         raw,
                         loaded_general_skill_names=loaded_general_skill_names,
+                        trace_sink=trace_sink,
+                        iteration=iteration,
                     )
-                    if action is None:
+                except ValidationError as first_error:
+                    if (
+                        action_protocol_repairs >= MAX_ACTION_PROTOCOL_REPAIRS_PER_TASK
+                        or not _last_tool_was_successful_artifact_publication(
+                            last_tool_name,
+                            last_tool_succeeded,
+                        )
+                    ):
                         raise
+                    action_protocol_repairs += 1
                     if trace_sink:
                         trace_sink(
-                            "harness_structured_result_adapted",
+                            "harness_action_repairing",
                             {
                                 "iteration": iteration,
-                                "source": loaded_general_skill_names[-1],
-                                "result_type": type(raw).__name__,
+                                "attempt": action_protocol_repairs,
+                                "error": str(first_error),
                             },
                         )
-            except (ValidationError, LLMError) as exc:
+                    repair_payload = dict(payload)
+                    repair_payload["action_protocol_repair"] = {
+                        "reason": "上一条模型输出不符合 HarnessAction JSON 协议。",
+                        "instruction": (
+                            "当前记录显示最终交付物已经发布。不得调用、重试或假定任何工具；"
+                            "仅依据当前任务和已记录的工具结果，输出一个合法的 action=finish JSON。"
+                        ),
+                    }
+                    with llm_operation(
+                        "harness.task_action_repair",
+                        task_frame_id=requirement.task_frame_id,
+                        iteration=iteration,
+                    ):
+                        raw = _deadline_llm_client(
+                            model_config,
+                            step_deadline_monotonic,
+                        ).generate_json(
+                            system_prompt,
+                            repair_payload,
+                        )
+                    action = _parse_harness_action(
+                        raw,
+                        loaded_general_skill_names=loaded_general_skill_names,
+                        trace_sink=trace_sink,
+                        iteration=iteration,
+                    )
+                    if action.action != "finish":
+                        raise HarnessActionRepairError(
+                            "协议修复只能返回 finish，不能发起新的工具调用。"
+                        )
+            except (ValidationError, LLMError, HarnessActionRepairError) as exc:
                 if _deadline_expired(step_deadline_monotonic):
                     return _step_timeout_result(
                         requirement,
@@ -172,11 +218,22 @@ class HarnessTaskAgent:
                 return TaskExecutionResult(
                     task_frame_id=requirement.task_frame_id,
                     status="failed",
-                    reply_fragment="当前任务的执行模型没有返回有效动作。",
-                    task_summary="Harness 动作解析失败。",
+                    reply_fragment=_action_protocol_failure_reply(artifacts),
+                    task_summary=(
+                        "Harness 动作解析失败，已完成一次协议修复尝试。"
+                        if action_protocol_repairs
+                        else "Harness 动作解析失败。"
+                    ),
                     capability_results=capability_results,
+                    citations=citations,
+                    evidence_results=evidence_results,
+                    artifacts=artifacts,
                     action_count=iteration,
-                    error={"code": "HARNESS_ACTION_INVALID", "message": str(exc)},
+                    error={
+                        "code": "HARNESS_ACTION_INVALID",
+                        "message": str(exc),
+                        "action_protocol_repairs": action_protocol_repairs,
+                    },
                 )
             _raise_if_cancelled(is_cancelled)
             if _deadline_expired(step_deadline_monotonic):
@@ -252,6 +309,8 @@ class HarnessTaskAgent:
 
             tool_name = str(action.tool_name or "").strip()
             if not tool_name or tool_name not in allowed_names:
+                last_tool_name = tool_name
+                last_tool_succeeded = False
                 transcript.append(
                     {
                         "role": "tool",
@@ -335,6 +394,8 @@ class HarnessTaskAgent:
                 if _is_non_retryable_failure(result):
                     non_retryable_action_signatures.add(action_signature)
             bounded_result = _bounded_capability_result(tool_name, result)
+            last_tool_name = tool_name
+            last_tool_succeeded = bool(result.get("success"))
             if _is_loaded_general_skill_result(tool_name, result):
                 loaded_general_skill_names.append(tool_name)
             transcript.extend(
@@ -481,6 +542,58 @@ def _is_non_retryable_failure(result: object) -> bool:
         return False
     error = result.get("error")
     return isinstance(error, dict) and error.get("retryable") is False
+
+
+def _last_tool_was_successful_artifact_publication(
+    tool_name: str | None,
+    succeeded: bool,
+) -> bool:
+    return tool_name == "publish_artifact" and succeeded
+
+
+def _parse_harness_action(
+    raw: object,
+    *,
+    loaded_general_skill_names: list[str],
+    trace_sink: TraceSink | None,
+    iteration: int,
+) -> HarnessAction:
+    try:
+        return HarnessAction.model_validate(raw)
+    except ValidationError:
+        action = _adapt_general_skill_structured_result(
+            raw,
+            loaded_general_skill_names=loaded_general_skill_names,
+        )
+        if action is None:
+            raise
+        if trace_sink:
+            trace_sink(
+                "harness_structured_result_adapted",
+                {
+                    "iteration": iteration,
+                    "source": loaded_general_skill_names[-1],
+                    "result_type": type(raw).__name__,
+                },
+            )
+        return action
+
+
+def _action_protocol_failure_reply(artifacts: list[dict[str, Any]]) -> str:
+    if artifacts:
+        names = [
+            str(item.get("display_name") or item.get("path") or "生成文件")
+            for item in artifacts
+            if isinstance(item, dict)
+        ]
+        names = [name for name in names if name]
+        if names:
+            return (
+                "任务收尾时模型未返回有效动作，已生成的文件仍可在本会话文件区下载："
+                + "、".join(dict.fromkeys(names))
+                + "。"
+            )
+    return "当前任务的执行模型没有返回有效动作。"
 
 
 def _adapt_general_skill_structured_result(
