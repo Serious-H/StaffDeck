@@ -856,11 +856,13 @@ class HarnessCapabilityInvoker:
                     "entrypoint": package.entrypoint,
                 },
                 "notice": (
-                    "技能包说明已加载到当前隔离 Harness transcript，且真实包文件已物化到"
-                    "当前 TaskFrame。请直接使用 package_workspace.relative_path 下的文件，"
-                    "按任务需要调用知识库、原装 Tool、exec_command 或 typed 文件工具；"
-                    "不要用 write_file 重写技能包中的脚本。技能本身不会生成临时代码，"
-                    "也不会启动第二套 runner。"
+                    "仅 SKILL.md 已加载到当前隔离 Harness transcript；package.files 其余"
+                    "条目只是文件清单，真实包文件已物化到当前 TaskFrame。若 SKILL.md 已"
+                    "给出明确脚本命令，请直接使用 package_workspace.relative_path 下的既有"
+                    "脚本，不要为执行而读取、重写或复制源码。只有 SKILL.md 明确要求读取"
+                    "某个额外文本文件，或执行失败需要诊断时，才通过 exec_command 按需、"
+                    "限量读取该文件。"
+                    "技能本身不会生成临时代码，也不会启动第二套 runner。"
                 ),
             },
         }
@@ -1370,23 +1372,26 @@ def _skill_package_preview(
     max_chars: int = 12_000,
 ) -> dict[str, Any]:
     package = package_from_row(skill)
-    remaining = max_chars
     files: list[dict[str, Any]] = []
+    entrypoint_truncated = False
     for item in package.files:
         content = str(item.content or "")
-        preview = content[:remaining]
-        remaining -= len(preview)
-        files.append(
-            {
-                "path": item.path,
-                "size": item.size,
-                "mime_type": item.mime_type,
-                "content_preview": preview,
-                "truncated": len(preview) < len(content),
-            }
-        )
-        if remaining <= 0:
-            break
+        summary: dict[str, Any] = {
+            "path": item.path,
+            "size": item.size,
+            "mime_type": item.mime_type,
+            "content_loaded": item.path == package.entrypoint,
+        }
+        if item.path == package.entrypoint:
+            preview = content[:max_chars]
+            entrypoint_truncated = len(preview) < len(content)
+            summary.update(
+                {
+                    "content_preview": preview,
+                    "truncated": entrypoint_truncated,
+                }
+            )
+        files.append(summary)
     return {
         "package_id": package.package_id,
         "version": package.version,
@@ -1394,8 +1399,8 @@ def _skill_package_preview(
         "entrypoint": package.entrypoint,
         "file_count": len(package.files),
         "files": files,
-        "truncated": len(files) < len(package.files)
-        or any(bool(item.get("truncated")) for item in files),
+        "content_policy": "entrypoint_only",
+        "truncated": entrypoint_truncated,
     }
 
 

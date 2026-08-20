@@ -160,7 +160,7 @@ def test_capability_selector_still_checks_knowledge_without_general_skills(monke
     received: dict[str, object] = {}
     monkeypatch.setattr(LLMClient, "__init__", lambda self, model_config: None)
 
-    def fake_generate_json(self, system_prompt, payload):  # noqa: ANN001
+    def fake_generate_json(self, system_prompt, payload):
         received.update(payload)
         return {
             "use_general_skill": False,
@@ -210,6 +210,42 @@ def test_general_skill_reader_does_not_generate_runner_code(monkeypatch) -> None
     assert response.generated_code == ""
     assert response.structured_result["operation"] == "read"
     assert any(item["phase"] == "read_created" for item in response.execution_trace)
+
+
+def test_general_skill_reader_only_loads_skill_md_content(monkeypatch) -> None:
+    monkeypatch.setattr(LLMClient, "__init__", lambda self, model_config: None)
+
+    def fake_generate_json(self, system_prompt, payload):
+        package = payload["skill"]["package"]
+        entrypoint, script = package["files"]
+        assert package["content_policy"] == "entrypoint_only"
+        assert entrypoint["content_loaded"] is True
+        assert entrypoint["content_preview"] == "# Fixed command"
+        assert script["content_loaded"] is False
+        assert "content_preview" not in script
+        return {
+            "reply": "该技能执行固定命令。",
+            "summary": "固定命令",
+            "inputs": [],
+            "side_effects": [],
+        }
+
+    monkeypatch.setattr(LLMClient, "generate_json", fake_generate_json)
+    skill = GeneralSkill(
+        tenant_id="tenant_demo",
+        slug="fixed-command",
+        name="固定命令",
+        skill_markdown="# Fixed command",
+        skill_files_json=[
+            {"path": "SKILL.md", "content": "# Fixed command"},
+            {"path": "scripts/run.py", "content": "TOKEN = 'private-token'"},
+        ],
+        status="published",
+    )
+
+    response = GeneralSkillReader().read(skill, "介绍这个 Skill", SimpleNamespace())
+
+    assert response.operation == "read"
 
 
 def test_general_skill_reader_returns_structured_failure(monkeypatch) -> None:

@@ -1016,24 +1016,32 @@ def _skill_files(skill: GeneralSkill) -> list[dict[str, Any]]:
 def _skill_package_payload(skill: GeneralSkill, preview_limit: int = 12000) -> dict[str, Any]:
     files = _skill_files(skill)
     previews: list[dict[str, Any]] = []
-    remaining = preview_limit
+    entrypoint_truncated = False
     for file in files:
         content = str(file.get("content") or "")
-        preview = content[: max(0, min(len(content), remaining))]
-        remaining -= len(preview)
-        previews.append(
-            {
-                "path": file["path"],
-                "size": file.get("size"),
-                "mime_type": file.get("mime_type"),
-                "content_preview": preview,
-                "truncated": len(preview) < len(content),
-            }
-        )
+        is_entrypoint = file["path"] == "SKILL.md"
+        summary: dict[str, Any] = {
+            "path": file["path"],
+            "size": file.get("size"),
+            "mime_type": file.get("mime_type"),
+            "content_loaded": is_entrypoint,
+        }
+        if is_entrypoint:
+            preview = content[:preview_limit]
+            entrypoint_truncated = len(preview) < len(content)
+            summary.update(
+                {
+                    "content_preview": preview,
+                    "truncated": entrypoint_truncated,
+                }
+            )
+        previews.append(summary)
     return {
         "entrypoint": "SKILL.md",
         "file_count": len(files),
         "files": previews,
+        "content_policy": "entrypoint_only",
+        "truncated": entrypoint_truncated,
     }
 
 
