@@ -385,6 +385,8 @@ export function useChatSession(options: UseChatSessionOptions = {}) {
     reflection_max_rounds: 1,
     agent_loop_max_actions: 32,
     sandbox_enabled: false,
+    execution_profile: 'platform',
+    sandbox_locked: true,
     harness_storage_path: '',
     effective_harness_storage_path: '',
     sandbox_network_mode: 'all',

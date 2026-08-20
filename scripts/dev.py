@@ -199,9 +199,10 @@ def _npm_executable() -> str:
 
 def _build_frontend() -> None:
     print("Building frontend bundle for single-port app...")
+    frontend_dir = ROOT_DIR / "frontend-enterprise"
     subprocess.run(
-        [_npm_executable(), "--prefix", str(ROOT_DIR / "frontend-enterprise"), "run", "build"],
-        cwd=ROOT_DIR,
+        [_npm_executable(), "run", "build"],
+        cwd=frontend_dir,
         check=True,
     )
 
