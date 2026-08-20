@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from pydantic import BaseModel
-from sqlmodel import Session
+from sqlmodel import Session, select
 
 from app.db.models import ChannelBinding, ChannelDelivery, Team, User
 
@@ -69,6 +69,8 @@ class ChannelBindingRead(BaseModel):
     default_handoff_assignee_user_id: Optional[str] = None
     default_handoff_assignee_name: Optional[str] = None
     identity_scope_key: Optional[str] = None
+    # 当前请求者对该绑定的管理角色:admin/owner/collaborator;无管理关系时为 None
+    my_role: Optional[str] = None
     created_at: str
     updated_at: str
 
@@ -86,6 +88,22 @@ class ChannelQRCodeStatusRead(BaseModel):
 class ChannelBindCodeRead(BaseModel):
     code: str
     expires_at: str
+
+
+class ChannelIdentityBindCodeCreate(BaseModel):
+    user_id: str
+
+
+class ChannelBindingManagerCreate(BaseModel):
+    user_id: str
+
+
+class ChannelBindingManagerRead(BaseModel):
+    user_id: str
+    name: Optional[str] = None
+    granted_at: str
+    granted_by_user_id: Optional[str] = None
+    granted_by_name: Optional[str] = None
 
 
 class MyIdentityBindingRead(BaseModel):
@@ -246,13 +264,46 @@ def _default_handoff_assignee_name(db: Session, binding: ChannelBinding) -> Opti
     return user.display_name or user.username
 
 
-def channel_binding_read(db: Session, binding: ChannelBinding) -> ChannelBindingRead:
+def channel_binding_my_role(
+    db: Session, binding: ChannelBinding, current_user: Optional[User]
+) -> Optional[str]:
+    """当前用户对该绑定的管理角色:admin/owner/collaborator;无管理关系时返回 None。"""
+    if current_user is None:
+        return None
+    from app.db.models import ChannelBindingManager
+    from app.security.permissions import is_admin_user
+
+    if is_admin_user(current_user):
+        return "admin"
+    if binding.created_by_user_id == current_user.id:
+        return "owner"
+    row = db.exec(
+        select(ChannelBindingManager).where(
+            ChannelBindingManager.binding_id == binding.id,
+            ChannelBindingManager.user_id == current_user.id,
+            ChannelBindingManager.revoked_at.is_(None),
+        )
+    ).first()
+    return "collaborator" if row else None
+
+
+def channel_binding_read(
+    db: Session, binding: ChannelBinding, current_user: Optional[User] = None
+) -> ChannelBindingRead:
     config = dict(binding.config_json or {})
     bound_at = config.get("bound_at")
     team_name: Optional[str] = None
     if binding.team_id:
         team = db.get(Team, binding.team_id)
         team_name = team.name if team else None
+    identity_scope_key = binding.identity_scope_key
+    if not identity_scope_key and binding.channel == "feishu":
+        app_id = str(config.get("app_id") or "").strip()
+        tenant_key = str(binding.provider_tenant_key or "").strip()
+        if app_id and tenant_key:
+            from app.channels.service_feishu_inbox import feishu_identity_scope
+
+            identity_scope_key = feishu_identity_scope(app_id, tenant_key)
     return ChannelBindingRead(
         id=binding.id,
         tenant_id=binding.tenant_id,
@@ -282,7 +333,8 @@ def channel_binding_read(db: Session, binding: ChannelBinding) -> ChannelBinding
             "default_handoff_assignee_user_id"
         ),
         default_handoff_assignee_name=_default_handoff_assignee_name(db, binding),
-        identity_scope_key=binding.identity_scope_key,
+        identity_scope_key=identity_scope_key,
+        my_role=channel_binding_my_role(db, binding, current_user),
         created_at=binding.created_at.isoformat(),
         updated_at=binding.updated_at.isoformat(),
     )

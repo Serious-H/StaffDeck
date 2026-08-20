@@ -95,6 +95,7 @@ class TaskExecutionResult(BaseModel):
     task_summary: str = ""
     action_count: int = 0
     error: dict[str, Any] | None = None
+    structured_result: Any | None = None
 
 
 class TaskRequestCompiler:

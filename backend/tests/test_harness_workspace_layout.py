@@ -96,3 +96,32 @@ def test_taskframe_layout_hides_harness_internal_directory_from_root_listing(
         "output",
         "work",
     }
+
+
+def test_taskframe_layout_denies_paths_outside_its_governed_workspace(
+    tmp_path: Path,
+) -> None:
+    workspace = (tmp_path / "task").resolve()
+    ensure_task_workspace_layout(workspace)
+    outside = tmp_path / "outside.txt"
+    outside.write_text("private", encoding="utf-8")
+    context = HarnessToolContext(
+        run_id="run-external-path",
+        workspace_root=workspace,
+        enforce_task_workspace_layout=True,
+    )
+
+    read_result = _execute(context, "read_file", {"path": "../outside.txt"})
+    write_result = _execute(
+        context,
+        "write_file",
+        {"path": str(outside), "content": "changed"},
+    )
+
+    assert read_result.success is False
+    assert read_result.error
+    assert read_result.error.code == "WORKSPACE_PATH_SCOPE_DENIED"
+    assert write_result.success is False
+    assert write_result.error
+    assert write_result.error.code == "WORKSPACE_PATH_SCOPE_DENIED"
+    assert outside.read_text(encoding="utf-8") == "private"

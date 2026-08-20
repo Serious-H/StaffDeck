@@ -4,6 +4,7 @@ import logging
 import os
 import threading
 import time
+from datetime import timedelta
 
 from sqlalchemy import or_, update
 from sqlalchemy.exc import IntegrityError
@@ -70,6 +71,11 @@ _staged_inbound_wake = threading.Event()
 _binding_intake_condition = threading.Condition()
 _binding_intake_active: dict[str, int] = {}
 _binding_intake_paused: set[str] = set()
+_INBOUND_LEASE_SECONDS = 15 * 60
+
+
+def _inbound_lease_deadline():
+    return utc_now() + timedelta(seconds=_INBOUND_LEASE_SECONDS)
 
 
 def current_processor_run_id() -> str:
@@ -163,8 +169,17 @@ def _claim_stale_event(db: Session, event_id: str) -> bool:
                 ChannelInboundEvent.processor_run_id.is_(None),
                 ChannelInboundEvent.processor_run_id != run_id,
             ),
+            or_(
+                ChannelInboundEvent.processor_run_id.is_(None),
+                ChannelInboundEvent.processor_lease_expires_at.is_(None),
+                ChannelInboundEvent.processor_lease_expires_at <= utc_now(),
+            ),
         )
-        .values(processor_run_id=run_id, updated_at=utc_now())
+        .values(
+            processor_run_id=run_id,
+            processor_lease_expires_at=_inbound_lease_deadline(),
+            updated_at=utc_now(),
+        )
     )
     db.commit()
     return result.rowcount == 1
@@ -184,11 +199,44 @@ def claim_staged_inbound(event_id: str, *, db_engine=None) -> bool:
             .values(
                 status="processing",
                 processor_run_id=current_processor_run_id(),
+                processor_lease_expires_at=_inbound_lease_deadline(),
                 updated_at=utc_now(),
             )
         )
         db.commit()
         return result.rowcount == 1
+
+
+def _finish_owned_inbound(
+    db: Session,
+    event_id: str,
+    *,
+    status: str,
+    error: str | None = None,
+    processed: bool = False,
+) -> bool:
+    """Finish/release an inbound event only while this process still owns its lease."""
+    values = {
+        "status": status,
+        "error": error,
+        "processor_run_id": None,
+        "processor_lease_expires_at": None,
+        "updated_at": utc_now(),
+    }
+    if processed:
+        values["processed_at"] = utc_now()
+    result = db.exec(
+        update(ChannelInboundEvent)
+        .where(
+            ChannelInboundEvent.id == event_id,
+            ChannelInboundEvent.status == "processing",
+            ChannelInboundEvent.processor_run_id == current_processor_run_id(),
+        )
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    )
+    db.commit()
+    return result.rowcount == 1
 
 
 def pause_binding_intake(binding_id: str, timeout_seconds: float = 5.0) -> bool:
@@ -239,7 +287,11 @@ def _release_stale_event_claim(db_engine, event_id: str) -> None:
                 ChannelInboundEvent.status == "processing",
                 ChannelInboundEvent.processor_run_id == run_id,
             )
-            .values(processor_run_id=None, updated_at=utc_now())
+            .values(
+                processor_run_id=None,
+                processor_lease_expires_at=None,
+                updated_at=utc_now(),
+            )
         )
         db.commit()
 
@@ -260,7 +312,11 @@ def _release_stale_event_claim_by_key(
                 ChannelInboundEvent.status == "processing",
                 ChannelInboundEvent.processor_run_id == run_id,
             )
-            .values(processor_run_id=None, updated_at=utc_now())
+            .values(
+                processor_run_id=None,
+                processor_lease_expires_at=None,
+                updated_at=utc_now(),
+            )
         )
         db.commit()
 
@@ -757,6 +813,20 @@ def _normalize_compat(binding: ChannelBinding, raw: dict) -> ChannelInbound | No
     return adapter.normalize(raw)
 
 
+def _feishu_reply_message_ids(inbound: ChannelInbound) -> list[str]:
+    """Return direct-parent and topic-root ids for reliable handoff matching."""
+    ids: list[str] = []
+    parent_id = str(inbound.parent_id or "").strip()
+    if parent_id:
+        ids.append(parent_id)
+    raw_message = (inbound.raw or {}).get("message")
+    if isinstance(raw_message, dict):
+        root_id = str(raw_message.get("root_id") or "").strip()
+        if root_id and root_id not in ids:
+            ids.append(root_id)
+    return ids
+
+
 def _try_handle_feishu_handoff_reply(
     db: Session,
     binding: ChannelBinding,
@@ -772,12 +842,12 @@ def _try_handle_feishu_handoff_reply(
     命中则复用 _apply_handoff_reply 置 answered + 恢复 SOP,并给处理人回一条确认。
     返回 True 表示已处理(短路 process_inbound);False 表示非 handoff 回复,继续正常流程。
     """
-    parent_id = str(inbound.parent_id or "").strip()
-    if not parent_id:
+    reply_ids = _feishu_reply_message_ids(inbound)
+    if not reply_ids:
         return False
     handoff = db.exec(
         select(HumanHandoffRequest).where(
-            HumanHandoffRequest.notify_message_id == parent_id,
+            HumanHandoffRequest.notify_message_id.in_(reply_ids),
             HumanHandoffRequest.status == "pending",
         )
     ).first()
@@ -791,7 +861,7 @@ def _try_handle_feishu_handoff_reply(
             ChannelDelivery.binding_id == binding.id,
             ChannelDelivery.kind == "handoff_notice",
             ChannelDelivery.session_id == f"handoff:{handoff.id}",
-            ChannelDelivery.message_id == parent_id,
+            ChannelDelivery.message_id.in_(reply_ids),
             ChannelDelivery.status == "delivered",
         )
     ).first()
@@ -896,12 +966,12 @@ def _run_handoff_reply_command(
 
     handoff: HumanHandoffRequest | None = None
     # 策略 1:引用通知 — 按 parent_id -> notify_message_id 精确匹配
-    parent_id = str(inbound.parent_id or "").strip()
-    if parent_id:
+    reply_ids = _feishu_reply_message_ids(inbound)
+    if reply_ids:
         handoff = db.exec(
             select(HumanHandoffRequest).where(
                 HumanHandoffRequest.tenant_id == binding.tenant_id,
-                HumanHandoffRequest.notify_message_id == parent_id,
+                HumanHandoffRequest.notify_message_id.in_(reply_ids),
                 HumanHandoffRequest.status == "pending",
             )
         ).first()
@@ -913,7 +983,7 @@ def _run_handoff_reply_command(
                 ChannelDelivery.binding_id == binding.id,
                 ChannelDelivery.kind == "handoff_notice",
                 ChannelDelivery.session_id == f"handoff:{handoff.id}",
-                ChannelDelivery.message_id == parent_id,
+                ChannelDelivery.message_id.in_(reply_ids),
                 ChannelDelivery.status == "delivered",
             )
         ).first()
@@ -1032,6 +1102,7 @@ def process_inbound(
                 target_json=target,
                 status="processing",
                 processor_run_id=current_processor_run_id(),
+                processor_lease_expires_at=_inbound_lease_deadline(),
             )
             db.add(event)
             try:
@@ -1361,12 +1432,14 @@ def process_inbound(
                 chat_session = db.get(ChatSession, session_id)
                 if not event or not chat_session:
                     return False
-                event.status = "failed"
-                event.error = str(exc)[:500]
-                event.updated_at = utc_now()
-                db.add(event)
-                _stage_error_notice(db, binding, chat_session)
-                db.commit()
+                if _finish_owned_inbound(
+                    db,
+                    event_id,
+                    status="failed",
+                    error=str(exc)[:500],
+                ):
+                    _stage_error_notice(db, binding, chat_session)
+                    db.commit()
                 return False
             else:
                 if trace_streamer:
@@ -1394,27 +1467,32 @@ def process_inbound(
                 # channel turn. Persist an explicit terminal notice for this
                 # delivery (which also removes the processing reaction), then
                 # release the inbox row for a later retry.
-                event.status = "received"
-                event.processor_run_id = None
-                event.error = response_reply[:500]
-                event.updated_at = utc_now()
-                db.add(event)
-                _stage_notice(
+                if _finish_owned_inbound(
                     db,
-                    binding,
-                    str(inbound.external_conv_id or ""),
-                    dict(event.target_json or {}),
-                    response_reply,
-                    final_for_event=True,
-                    idempotency_key=f"channel-runtime-conflict:{binding.id}:{event.event_id}",
-                )
-                db.commit()
+                    event_id,
+                    status="received",
+                    error=response_reply[:500],
+                ):
+                    _stage_notice(
+                        db,
+                        binding,
+                        str(inbound.external_conv_id or ""),
+                        dict(event.target_json or {}),
+                        response_reply,
+                        final_for_event=True,
+                        idempotency_key=(
+                            f"channel-runtime-conflict:{binding.id}:{event.event_id}"
+                        ),
+                    )
+                    db.commit()
                 return False
-            event.status = "done"
-            event.processed_at = utc_now()
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            if not _finish_owned_inbound(
+                db,
+                event_id,
+                status="done",
+                processed=True,
+            ):
+                return False
             if team is not None:
                 # TL 回复后处理:解析派任务块并创建任务(与主聊天端同语义);
                 # 后处理失败不影响本轮回复
@@ -1462,6 +1540,7 @@ def process_staged_inbound(event_pk: str, *, db_engine=None) -> bool:
                 .values(
                     status="received",
                     processor_run_id=None,
+                    processor_lease_expires_at=None,
                     updated_at=utc_now(),
                 )
             )
@@ -1654,61 +1733,52 @@ def _decode_and_validate_staged_event(
 
 def _recover_stale_durable_event(event_pk: str, *, db_engine=None) -> bool:
     use_engine = db_engine or engine
-    run_id = current_processor_run_id()
     with Session(use_engine) as db:
         event = db.get(ChannelInboundEvent, event_pk)
         binding = db.get(ChannelBinding, event.binding_id) if event else None
         if not event or not binding or event.status != "processing":
             return False
+        if not _claim_stale_event(db, event_pk):
+            return False
+        event = db.get(ChannelInboundEvent, event_pk)
         try:
             inbound = _decode_and_validate_staged_event(event, binding)
         except ValueError as exc:
-            event.status = "failed"
-            event.error = str(exc)[:500]
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            _finish_owned_inbound(
+                db,
+                event_pk,
+                status="failed",
+                error=str(exc)[:500],
+            )
             return False
         turn_message = _find_turn_user_message_in_conv(
             db, binding, inbound.external_conv_id, inbound.event_id
         )
         if turn_message:
-            if not _claim_stale_event(db, event_pk):
-                return False
-            event = db.get(ChannelInboundEvent, event_pk)
             if _turn_reply_exists(db, binding, turn_message):
-                event.status = "done"
-                event.error = None
-                event.processed_at = utc_now()
-            else:
-                event.status = "failed"
-                event.error = "process_exit_incomplete_turn"
-                _stage_interrupted_notice(
+                _finish_owned_inbound(
                     db,
-                    binding,
-                    turn_message.session_id,
-                    dict(event.target_json or {}),
-                    inbound.event_id,
+                    event_pk,
+                    status="done",
+                    processed=True,
                 )
-            event.updated_at = utc_now()
-            db.add(event)
-            db.commit()
+            else:
+                if _finish_owned_inbound(
+                    db,
+                    event_pk,
+                    status="failed",
+                    error="process_exit_incomplete_turn",
+                ):
+                    _stage_interrupted_notice(
+                        db,
+                        binding,
+                        turn_message.session_id,
+                        dict(event.target_json or {}),
+                        inbound.event_id,
+                    )
+                    db.commit()
             return False
-        released = db.exec(
-            update(ChannelInboundEvent)
-            .where(
-                ChannelInboundEvent.id == event_pk,
-                ChannelInboundEvent.channel.in_({"feishu", "wecom", "dingtalk"}),
-                ChannelInboundEvent.status == "processing",
-                or_(
-                    ChannelInboundEvent.processor_run_id.is_(None),
-                    ChannelInboundEvent.processor_run_id != run_id,
-                ),
-            )
-            .values(status="received", processor_run_id=None, updated_at=utc_now())
-        )
-        db.commit()
-        if released.rowcount != 1:
+        if not _finish_owned_inbound(db, event_pk, status="received"):
             return False
     return process_staged_inbound(event_pk, db_engine=use_engine)
 
@@ -1728,6 +1798,11 @@ def sweep_stale_inbound_events(*, db_engine=None) -> int:
                 or_(
                     ChannelInboundEvent.processor_run_id.is_(None),
                     ChannelInboundEvent.processor_run_id != run_id,
+                ),
+                or_(
+                    ChannelInboundEvent.processor_run_id.is_(None),
+                    ChannelInboundEvent.processor_lease_expires_at.is_(None),
+                    ChannelInboundEvent.processor_lease_expires_at <= utc_now(),
                 ),
             )
         ).all()
