@@ -1,5 +1,6 @@
 import os as _os
 from functools import lru_cache
+from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -15,6 +16,10 @@ class Settings(BaseSettings):
     model_thinking_mode: str = ""
     model_thinking_models: str = ""
     tool_timeout_seconds: float = 8.0
+    # Platform deployments execute tasks on a shared service host and must not
+    # silently fall back to host-level command execution. ``local`` is an
+    # explicit opt-in profile for a trusted personal desktop assistant.
+    execution_profile: Literal["platform", "local"] = "platform"
     a2a_task_timeout_seconds: float = 600.0
     a2a_poll_interval_seconds: float = 0.5
     codex_a2a_enabled: bool = False
@@ -72,6 +77,10 @@ class Settings(BaseSettings):
     @property
     def general_skill_runtime_package_list(self) -> list[str]:
         return [item.strip() for item in self.general_skill_runtime_packages.split(",") if item.strip()]
+
+    @property
+    def requires_task_sandbox(self) -> bool:
+        return self.execution_profile == "platform"
 
 
 @lru_cache

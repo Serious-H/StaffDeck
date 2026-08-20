@@ -8,6 +8,7 @@ from pathlib import Path
 from sqlmodel import Session, select
 
 from app import paths
+from app.config import get_settings
 from app.db.models import (
     HarnessInvocationRecord,
     HarnessRunRecord,
@@ -197,7 +198,12 @@ def harness_storage_root(*, tenant_id: str, db: Session | None = None) -> Path:
     if db is not None:
         row = db.get(UIConfig, tenant_id)
         configured = str(getattr(row, "harness_storage_path", "") or "").strip()
-        if row is not None and not bool(getattr(row, "sandbox_enabled", False)) and configured:
+        if (
+            not get_settings().requires_task_sandbox
+            and row is not None
+            and not bool(getattr(row, "sandbox_enabled", False))
+            and configured
+        ):
             return Path(configured).expanduser().resolve()
     return default_root
 

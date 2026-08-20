@@ -1,15 +1,20 @@
 from __future__ import annotations
 
 import pytest
+from fastapi import HTTPException
 from pydantic import ValidationError
-
-from app.api import ui_config as ui_config_module
-from app.api.ui_config import UIConfigUpdateRequest, ui_config_read
-from app.api.ui_config import update_enterprise_ui_config
-from app.core.agent_loop import AgentLoop
-from app.db.models import Tenant, UIConfig, User
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
+
+from app.api import ui_config as ui_config_module
+from app.api.ui_config import (
+    UIConfigUpdateRequest,
+    ui_config_read,
+    update_enterprise_ui_config,
+)
+from app.config import get_settings
+from app.core.agent_loop import AgentLoop
+from app.db.models import Tenant, UIConfig, User
 from app.harness.sandbox import SandboxDiagnostics
 
 
@@ -89,9 +94,29 @@ def test_windows_setup_prompt_is_based_on_backend_host(
     assert "node srt-cli.js windows-install" in (result.sandbox_setup_instructions or "")
 
 
-def test_sandbox_is_disabled_by_default_without_running_diagnostics(
+def test_platform_profile_requires_sandbox_even_when_tenant_setting_is_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        ui_config_module,
+        "diagnostics",
+        lambda: SandboxDiagnostics(status="ready", code=None, message="ok", backend="srt"),
+    )
+
+    result = ui_config_read(UIConfig(tenant_id="tenant_demo"))
+
+    assert result.execution_profile == "platform"
+    assert result.sandbox_locked is True
+    assert result.sandbox_enabled is True
+    assert result.sandbox_status == "ready"
+    assert result.sandbox_backend == "srt"
+
+
+def test_local_profile_allows_sandbox_to_be_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = get_settings().model_copy(update={"execution_profile": "local"})
+    monkeypatch.setattr(ui_config_module, "get_settings", lambda: settings)
     monkeypatch.setattr(
         ui_config_module,
         "diagnostics",
@@ -100,6 +125,8 @@ def test_sandbox_is_disabled_by_default_without_running_diagnostics(
 
     result = ui_config_read(UIConfig(tenant_id="tenant_demo"))
 
+    assert result.execution_profile == "local"
+    assert result.sandbox_locked is False
     assert result.sandbox_enabled is False
     assert result.sandbox_status == "disabled"
     assert result.sandbox_backend == "disabled"
@@ -115,6 +142,8 @@ def test_sandbox_toggle_schedules_application_restart(
     )
     SQLModel.metadata.create_all(engine)
     scheduled: list[bool] = []
+    settings = get_settings().model_copy(update={"execution_profile": "local"})
+    monkeypatch.setattr(ui_config_module, "get_settings", lambda: settings)
     monkeypatch.setattr(ui_config_module, "_schedule_application_restart", lambda: scheduled.append(True))
     monkeypatch.setattr(
         ui_config_module,
@@ -139,3 +168,34 @@ def test_sandbox_toggle_schedules_application_restart(
 
     assert result.restart_scheduled is True
     assert scheduled == [True]
+
+
+def test_platform_profile_rejects_disabling_the_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as db:
+        db.add(Tenant(id="tenant_demo", name="Demo"))
+        db.commit()
+        admin = User(
+            id="user_admin",
+            tenant_id="tenant_demo",
+            username="admin",
+            password_hash="unused",
+            role="admin",
+        )
+
+        with pytest.raises(HTTPException) as rejected:
+            update_enterprise_ui_config(
+                UIConfigUpdateRequest(tenant_id="tenant_demo", sandbox_enabled=False),
+                db,
+                admin,
+            )
+
+    assert rejected.value.status_code == 422
+    assert "Platform Profile" in str(rejected.value.detail)

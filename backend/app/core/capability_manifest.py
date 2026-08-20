@@ -14,6 +14,7 @@ from app.agents.branching import (
     visible_tool_rows,
 )
 from app.capabilities.local_general_skill import package_from_row
+from app.config import get_settings
 from app.core.task_request_compiler import (
     CapabilityDescriptor,
     CapabilityManifest,
@@ -63,7 +64,9 @@ class CapabilityManifestBuilder:
 
         available.extend(_internal_capability_descriptors())
         ui_config = self.db.get(UIConfig, tenant_id)
-        sandbox_enabled = bool(getattr(ui_config, "sandbox_enabled", False))
+        sandbox_enabled = get_settings().requires_task_sandbox or bool(
+            getattr(ui_config, "sandbox_enabled", False)
+        )
 
         builtin_registry = build_file_tool_registry()
         register_command_tools(builtin_registry)

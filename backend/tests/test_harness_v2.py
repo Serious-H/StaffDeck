@@ -13,7 +13,9 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from app.agents.branching import ensure_open_gallery_binding
 from app.capabilities.local_general_skill import package_from_row
+from app.config import get_settings
 from app.core import harness_agent as harness_agent_module
+from app.core import harness_capability_invoker as harness_capability_invoker_module
 from app.core import turn_planner as turn_planner_module
 from app.core.agent_loop import AgentLoop
 from app.core.capability_manifest import (
@@ -72,6 +74,7 @@ from app.db.models import (
     Skill,
     Tenant,
     Tool,
+    UIConfig,
     utc_now,
 )
 from app.general_skills.schema import GeneralSkillRunResponse
@@ -1629,6 +1632,34 @@ def test_file_mutation_is_private_until_publish_artifact_succeeds(
     assert artifact["sandbox_path"] == "/workspace/output/reports/result.txt"
     assert artifact["workspace_file_ref"]["file_kind"] == "deliverable"
     assert artifact["workspace_file_ref"]["visibility"] == "session"
+
+
+def test_platform_profile_requires_sandbox_for_every_harness_invoker(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    settings = get_settings().model_copy(update={"execution_profile": "platform"})
+    monkeypatch.setattr(harness_capability_invoker_module, "get_settings", lambda: settings)
+    engine = _test_engine()
+    with Session(engine) as db:
+        db.add(UIConfig(tenant_id="tenant-demo", sandbox_enabled=False))
+        db.commit()
+        manifest = CapabilityManifestBuilder(db).build("tenant-demo", None, None, None)
+        invoker = HarnessCapabilityInvoker(
+            db,
+            tenant_id="tenant-demo",
+            session=_chat_session(),
+            task_frame_id="task-platform-sandbox",
+            model_config=_model_config(),
+            manifest=manifest,
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+        )
+
+    assert invoker._file_context.sandbox_enabled is True
+    assert invoker._file_context.sandbox_required is True
 
 
 def test_later_taskframe_materializes_a_session_file_ref_into_its_input(

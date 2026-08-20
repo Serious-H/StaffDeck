@@ -17,6 +17,7 @@ from sqlmodel import Session, select
 from app.capabilities.local_general_skill import (
     package_from_row,
 )
+from app.config import get_settings
 from app.core.capability_discovery import (
     CAPABILITY_SEARCH_MAX_RESULTS,
     catalog_entry,
@@ -138,7 +139,10 @@ class HarnessCapabilityInvoker:
         self._workspace_snapshot = snapshot_harness_workspace(self.workspace_root)
         self._registered_session_artifact_paths: set[str] = set()
         ui_config = self.db.get(UIConfig, tenant_id)
-        sandbox_enabled = bool(getattr(ui_config, "sandbox_enabled", False))
+        sandbox_required = get_settings().requires_task_sandbox
+        sandbox_enabled = sandbox_required or bool(
+            getattr(ui_config, "sandbox_enabled", False)
+        )
         sandbox_mode = parse_network_policy(
             getattr(ui_config, "sandbox_network_mode", None) if ui_config else None
         )
@@ -156,6 +160,7 @@ class HarnessCapabilityInvoker:
             tenant_id=tenant_id,
             workspace_root=self.workspace_root,
             sandbox_enabled=sandbox_enabled,
+            sandbox_required=sandbox_required,
             sandbox_network_mode=sandbox_mode,
             sandbox_allowed_domains=sandbox_domains,
             enforce_task_workspace_layout=True,

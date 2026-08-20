@@ -31,8 +31,17 @@ sets the local single-port origin by default and can add a public tunnel origin 
 
 ## Agent process sandbox
 
-Commands exposed by the Harness are always executed through an OS process
-sandbox. Anthropic's Sandbox Runtime is the preferred backend because it uses
+This deployment defaults to `STAFFDECK_EXECUTION_PROFILE=platform`. In this
+profile, every Harness TaskFrame must use an OS process sandbox; the Runtime
+Settings page cannot disable it. This is the recommended profile for shared
+servers, API-facing digital employees, and multi-tenant deployments.
+
+Set `STAFFDECK_EXECUTION_PROFILE=local` only for a trusted personal desktop
+assistant. In that profile, an administrator may deliberately disable the
+sandbox to let an agent access user-provided host paths and local CLI tools.
+It must not be used for a shared service host.
+
+Anthropic's Sandbox Runtime is the preferred backend because it uses
 the native primitive on macOS, Linux, and Windows. Release builds bundle the
 SRT package and a matching Node binary, so end users do not need Node or a
 global npm installation. Source deployments prepare the same reviewed runtime
@@ -52,7 +61,10 @@ development explicitly sets `STAFFDECK_ALLOW_GLOBAL_SRT=true`; normal
 When `srt` is unavailable, Linux deployments may use the existing Bubblewrap
 backend (`bwrap`). There is no unsandboxed fallback: the `exec_command`
 capability is reported as unavailable until one of these backends is installed.
-The sandbox keeps the current TaskFrame workspace as the only writable area.
+In Platform Profile, the TaskFrame root is read-only to the process: `input/`
+contains explicit inputs, `work/` is writable for temporary data, and `output/`
+is writable for final deliverables. The sandbox keeps this governed workspace
+as the only writable area.
 The tenant administrator selects unrestricted network access (the default), a
 domain allowlist, or complete network denial in Runtime Settings. Policies are
 enforced by SRT and fail closed when the selected backend cannot represent one.

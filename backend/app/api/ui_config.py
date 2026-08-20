@@ -12,6 +12,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlmodel import Session
 
 from app import paths
+from app.config import get_settings
 from app.db import get_session
 from app.db.models import UIConfig, User, utc_now
 from app.harness.sandbox import diagnostics, windows_install_command
@@ -35,6 +36,8 @@ class UIConfigRead(BaseModel):
     reflection_max_rounds: int
     agent_loop_max_actions: int
     sandbox_enabled: bool = False
+    execution_profile: Literal["platform", "local"] = "platform"
+    sandbox_locked: bool = False
     harness_storage_path: str = ""
     effective_harness_storage_path: str = ""
     restart_scheduled: bool = False
@@ -66,9 +69,11 @@ class UIConfigUpdateRequest(BaseModel):
 
 
 def ui_config_read(row: UIConfig, *, restart_scheduled: bool = False) -> UIConfigRead:
-    report = diagnostics() if row.sandbox_enabled else None
+    sandbox_required = _sandbox_required()
+    sandbox_enabled = sandbox_required or bool(row.sandbox_enabled)
+    report = diagnostics() if sandbox_enabled else None
     windows_setup_required = (
-        row.sandbox_enabled
+        sandbox_enabled
         and sys.platform == "win32"
         and report is not None
         and report.code == "SANDBOX_WINDOWS_SETUP_REQUIRED"
@@ -80,7 +85,9 @@ def ui_config_read(row: UIConfig, *, restart_scheduled: bool = False) -> UIConfi
         show_tool_trace=row.show_tool_trace,
         reflection_max_rounds=row.reflection_max_rounds,
         agent_loop_max_actions=row.agent_loop_max_actions,
-        sandbox_enabled=bool(row.sandbox_enabled),
+        sandbox_enabled=sandbox_enabled,
+        execution_profile=get_settings().execution_profile,
+        sandbox_locked=sandbox_required,
         harness_storage_path=str(row.harness_storage_path or ""),
         effective_harness_storage_path=_effective_storage_path(row),
         restart_scheduled=restart_scheduled,
@@ -143,15 +150,24 @@ def update_enterprise_ui_config(
     current_user: User = Depends(get_current_user),
 ) -> UIConfigRead:
     ensure_tenant_admin(request.tenant_id, current_user)
+    if _sandbox_required() and not request.sandbox_enabled:
+        raise HTTPException(
+            status_code=422,
+            detail="当前服务运行在 Platform Profile，任务沙盒必须保持启用。",
+        )
     row = get_or_create_ui_config(db, request.tenant_id)
-    sandbox_changed = bool(row.sandbox_enabled) != request.sandbox_enabled
+    sandbox_required = _sandbox_required()
+    requested_sandbox_enabled = sandbox_required or request.sandbox_enabled
+    sandbox_changed = (
+        sandbox_required or bool(row.sandbox_enabled)
+    ) != requested_sandbox_enabled
     storage_path = _validate_storage_path(request.harness_storage_path)
     row.show_thinking_trace = request.show_thinking_trace
     row.show_skill_trace = request.show_skill_trace
     row.show_tool_trace = request.show_tool_trace
     row.reflection_max_rounds = request.reflection_max_rounds
     row.agent_loop_max_actions = request.agent_loop_max_actions
-    row.sandbox_enabled = request.sandbox_enabled
+    row.sandbox_enabled = requested_sandbox_enabled
     row.harness_storage_path = storage_path
     row.sandbox_network_mode = request.sandbox_network_mode
     row.sandbox_allowed_domains = request.sandbox_allowed_domains
@@ -195,7 +211,7 @@ def _validate_storage_path(value: str) -> str | None:
 
 
 def _effective_storage_path(row: UIConfig) -> str:
-    if not row.sandbox_enabled and row.harness_storage_path:
+    if not (_sandbox_required() or row.sandbox_enabled) and row.harness_storage_path:
         return str(Path(row.harness_storage_path).expanduser().resolve())
     try:
         return str((paths.user_data_dir() / "harness_workspaces").resolve())
@@ -203,6 +219,10 @@ def _effective_storage_path(row: UIConfig) -> str:
         # Diagnostics and API reads must remain side-effect safe even when the
         # configured home directory is not writable (for example unit tests).
         return ""
+
+
+def _sandbox_required() -> bool:
+    return get_settings().requires_task_sandbox
 
 
 _restart_lock = threading.Lock()

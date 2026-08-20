@@ -358,6 +358,8 @@ export type UIConfigRead = {
   reflection_max_rounds: number;
   agent_loop_max_actions: number;
   sandbox_enabled: boolean;
+  execution_profile: 'platform' | 'local';
+  sandbox_locked: boolean;
   harness_storage_path: string;
   effective_harness_storage_path: string;
   restart_scheduled?: boolean;

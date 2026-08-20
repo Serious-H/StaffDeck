@@ -55,6 +55,44 @@ def test_exec_command_fails_closed_without_bubblewrap(
     assert result.error.code == "SANDBOX_UNAVAILABLE"
 
 
+def test_required_sandbox_never_degrades_to_windows_host_execution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(command_module.sys, "platform", "win32")
+    monkeypatch.setattr(command_module, "available_backend", lambda: None)
+    monkeypatch.setattr(
+        command_module,
+        "_bubblewrap_executable",
+        lambda: (_ for _ in ()).throw(
+            HarnessExecutionError("SANDBOX_UNAVAILABLE", "no bubblewrap")
+        ),
+    )
+    monkeypatch.setattr(
+        command_module,
+        "require_backend",
+        lambda: (_ for _ in ()).throw(
+            HarnessExecutionError("SANDBOX_UNAVAILABLE", "no sandbox")
+        ),
+    )
+    context = HarnessToolContext(
+        run_id="required-sandbox",
+        task_frame_id="frame",
+        workspace_root=(tmp_path / "workspace").resolve(),
+        sandbox_enabled=False,
+        sandbox_required=True,
+    )
+
+    result = HarnessExecutor(build_command_tool_registry()).execute(
+        context,
+        HarnessToolCall(call_id="call", name="exec_command", arguments={"command": "pwd"}),
+    )
+
+    assert result.success is False
+    assert result.error is not None
+    assert result.error.code == "SANDBOX_UNAVAILABLE"
+
+
 @pytest.mark.parametrize(
     "command",
     [

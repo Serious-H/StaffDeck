@@ -149,7 +149,8 @@ def exec_command(
         if context.enforce_task_workspace_layout
         else {}
     )
-    backend = available_backend() if context.sandbox_enabled else "unsandboxed"
+    sandbox_enabled = context.sandbox_enabled or context.sandbox_required
+    backend = available_backend() if sandbox_enabled else "unsandboxed"
     # Keep the existing Bubblewrap seam patchable for unit tests and Linux
     # deployments where the executable is provisioned outside PATH lookup.
     if backend is None:
@@ -160,12 +161,16 @@ def exec_command(
         else:
             backend = "bubblewrap"
     if backend is None:
-        backend = "unsandboxed" if sys.platform == "win32" else require_backend()
+        backend = (
+            require_backend()
+            if context.sandbox_required
+            else ("unsandboxed" if sys.platform == "win32" else require_backend())
+        )
     elif backend == "srt":
         try:
             ensure_backend_usable(backend)
         except HarnessExecutionError:
-            if sys.platform != "win32":
+            if context.sandbox_required or sys.platform != "win32":
                 raise
             backend = "unsandboxed"
     else:
@@ -308,6 +313,7 @@ def run_sandboxed_process(
     network_mode: str = "all",
     allowed_domains: tuple[str, ...] = (),
     sandbox_enabled: bool = True,
+    sandbox_required: bool = False,
     env: dict[str, str] | None = None,
     env_path_keys: tuple[str, ...] = (),
     is_cancelled: Callable[[], bool] | None = None,
@@ -325,6 +331,7 @@ def run_sandboxed_process(
     # ``argv`` is assembled by the trusted runner, not supplied by the model.
     # Runtime interpreters and materialized scripts are intentionally absolute
     # paths; shell command validation belongs to ``exec_command`` only.
+    sandbox_enabled = sandbox_enabled or sandbox_required
     backend = available_backend() if sandbox_enabled else "unsandboxed"
     if backend is None:
         try:
@@ -334,12 +341,16 @@ def run_sandboxed_process(
         else:
             backend = "bubblewrap"
     if backend is None:
-        backend = "unsandboxed" if sys.platform == "win32" else require_backend()
+        backend = (
+            require_backend()
+            if sandbox_required
+            else ("unsandboxed" if sys.platform == "win32" else require_backend())
+        )
     elif backend == "srt":
         try:
             ensure_backend_usable(backend)
         except HarnessExecutionError:
-            if sys.platform != "win32":
+            if sandbox_required or sys.platform != "win32":
                 raise
             backend = "unsandboxed"
     if backend == "unsandboxed":

@@ -15,6 +15,7 @@ from tempfile import mkdtemp
 from typing import Any
 
 from app import paths
+from app.config import get_settings
 from app.db.models import GeneralSkill, ModelConfig
 from app.general_skills.package_materialization import materialize_general_skill_package
 from app.general_skills.runtime_env import (
@@ -659,6 +660,8 @@ class GeneralSkillRunner:
     ) -> tuple[str, str, dict[str, Any]]:
         sandbox_network_mode = sandbox_network_mode or "all"
         sandbox_allowed_domains = sandbox_allowed_domains or ()
+        sandbox_required = get_settings().requires_task_sandbox
+        sandbox_enabled = sandbox_enabled or sandbox_required
         _raise_if_cancelled(is_cancelled)
         if workspace_root is not None:
             workspace_root.mkdir(parents=True, exist_ok=True)
@@ -759,6 +762,7 @@ class GeneralSkillRunner:
                 network_mode=sandbox_network_mode,
                 allowed_domains=sandbox_allowed_domains,
                 sandbox_enabled=sandbox_enabled,
+                sandbox_required=sandbox_required,
                 is_cancelled=is_cancelled,
             )
         except HarnessExecutionError as exc:

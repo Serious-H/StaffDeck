@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal, Mapping, TypeAlias
+from typing import Any, Literal, TypeAlias
 
 JsonValue: TypeAlias = (
     None | bool | int | float | str | list["JsonValue"] | dict[str, "JsonValue"]
@@ -50,6 +51,10 @@ class HarnessToolContext:
     # Internal/direct callers preserve the fail-closed historical behavior.
     # Tenant runtime code always passes the administrator's explicit setting.
     sandbox_enabled: bool = True
+    # Shared-service deployments may require an OS sandbox even when a stale
+    # tenant configuration says otherwise. A required sandbox never degrades
+    # to direct host execution.
+    sandbox_required: bool = False
     sandbox_network_mode: Literal["all", "allowlist", "deny"] = "all"
     sandbox_allowed_domains: tuple[str, ...] = ()
     # Direct/internal callers preserve the historical root-wide workspace

@@ -43,6 +43,8 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
   const [updatedAt, setUpdatedAt] = useState('');
   const [setupMessage, setSetupMessage] = useState('');
   const [effectiveStoragePath, setEffectiveStoragePath] = useState('');
+  const [executionProfile, setExecutionProfile] = useState<'platform' | 'local'>('platform');
+  const [sandboxLocked, setSandboxLocked] = useState(false);
   const [apiKeyOpen, setApiKeyOpen] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [sandboxStatus, setSandboxStatus] = useState<Pick<UIConfigRead, 'sandbox_status' | 'sandbox_status_message' | 'sandbox_status_remediation'>>({});
@@ -62,6 +64,8 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
           sandbox_network_mode: row.sandbox_network_mode || 'all',
           sandbox_allowed_domains: (row.sandbox_allowed_domains || []).join('\n'),
         });
+        setExecutionProfile(row.execution_profile);
+        setSandboxLocked(row.sandbox_locked);
         setUpdatedAt(row.updated_at);
         setEffectiveStoragePath(row.effective_harness_storage_path || '');
         setSetupMessage(row.sandbox_setup_instructions || '');
@@ -86,7 +90,7 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
         show_tool_trace: form.show_tool_trace,
         reflection_max_rounds: reflectionMaxRounds,
         agent_loop_max_actions: agentLoopMaxActions,
-        sandbox_enabled: form.sandbox_enabled,
+        sandbox_enabled: sandboxLocked ? true : form.sandbox_enabled,
         harness_storage_path: form.harness_storage_path.trim(),
         sandbox_network_mode: form.sandbox_network_mode,
         sandbox_allowed_domains: form.sandbox_allowed_domains.split(/[\n,]/).map((item) => item.trim()).filter(Boolean),
@@ -130,21 +134,22 @@ export default function RuntimeSettingsPage({ currentUser }: { currentUser: Ente
       <Card className="editor-card settings-card">
         <CardHeader><CardTitle className="flex items-center gap-[8px]"><ShieldCheck className="size-[16px]" />执行隔离与文件存储</CardTitle></CardHeader>
         <CardContent className="flex flex-col gap-[16px]">
-          <SwitchRow label="启用 SRT 沙盒" checked={form.sandbox_enabled} onChange={(next) => update({ sandbox_enabled: next })} hint="仅管理员可修改。打开或关闭后保存将自动重启 StaffDeck。默认关闭。" />
+          <SwitchRow label="启用 SRT 沙盒" checked={form.sandbox_enabled} disabled={sandboxLocked} onChange={(next) => update({ sandbox_enabled: next })} hint={sandboxLocked ? '当前服务运行在园区 Platform Profile，任务沙盒由服务端强制启用。' : '仅管理员可修改。打开或关闭后保存将自动重启 StaffDeck。'} />
+          {sandboxLocked && <div className="rounded-md border border-sky-200 bg-sky-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-sky-900">当前执行档位：{executionProfile === 'platform' ? 'Platform Profile（园区服务端）' : 'Local Profile'}。任务只能使用受治理工作区，不能降级为宿主机直接执行。</div>}
           <div className={`whitespace-pre-line rounded-md border px-[12px] py-[10px] text-[12px] leading-[18px] ${sandboxStatus.sandbox_status === 'ready' ? 'border-emerald-200 bg-emerald-50 text-emerald-900' : sandboxStatus.sandbox_status === 'degraded' ? 'border-red-300 bg-red-50 text-red-900' : sandboxStatus.sandbox_status === 'disabled' ? 'border-slate-200 bg-slate-50 text-slate-700' : 'border-amber-200 bg-amber-50 text-amber-900'}`}>
             <div className="font-medium">沙盒状态：{sandboxStatus.sandbox_status === 'ready' ? '可用' : sandboxStatus.sandbox_status === 'degraded' ? '已降级为无沙盒（高风险）' : sandboxStatus.sandbox_status === 'disabled' ? '未启用' : '不可用'}</div>
             {sandboxStatus.sandbox_status_message && <div>{sandboxStatus.sandbox_status_message}</div>}
             {sandboxStatus.sandbox_status_remediation && <div>{sandboxStatus.sandbox_status_remediation}</div>}
           </div>
           {setupMessage && <div className="whitespace-pre-line rounded-md border border-amber-200 bg-amber-50 px-[12px] py-[10px] text-[12px] leading-[18px] text-amber-900">{setupMessage}</div>}
-          {!form.sandbox_enabled && <LabeledField label="文件存储目录" hint={`沙盒关闭时，附件、任务文件与生成产物写入此目录。留空使用默认目录${effectiveStoragePath ? `：${effectiveStoragePath}` : ''}。`}><Input value={form.harness_storage_path} onChange={(e) => update({ harness_storage_path: e.target.value })} placeholder={effectiveStoragePath || '/data/staffdeck-files'} /></LabeledField>}
+          {!sandboxLocked && !form.sandbox_enabled && <LabeledField label="文件存储目录" hint={`沙盒关闭时，附件、任务文件与生成产物写入此目录。留空使用默认目录${effectiveStoragePath ? `：${effectiveStoragePath}` : ''}。`}><Input value={form.harness_storage_path} onChange={(e) => update({ harness_storage_path: e.target.value })} placeholder={effectiveStoragePath || '/data/staffdeck-files'} /></LabeledField>}
           {form.sandbox_enabled && <LabeledField label="网络访问" hint="统一影响所有 Harness/SRT 执行。默认联网按运行环境放行；白名单只允许列出的域名；全拒绝禁止外网。">
             <select className="h-[36px] rounded-md border border-input bg-background px-[10px] text-[13px]" value={form.sandbox_network_mode} onChange={(e) => update({ sandbox_network_mode: e.target.value as UiConfigForm['sandbox_network_mode'] })}>
               <option value="all">默认联网</option><option value="allowlist">白名单</option><option value="deny">全拒绝</option>
             </select>
           </LabeledField>}
           {form.sandbox_enabled && form.sandbox_network_mode === 'allowlist' && <LabeledField label="允许的域名" hint="每行一个域名，也支持 *.example.com。"><Textarea rows={4} value={form.sandbox_allowed_domains} onChange={(e) => update({ sandbox_allowed_domains: e.target.value })} placeholder="api.example.com\n*.internal.example.com" /></LabeledField>}
-          <p className="text-[11px] leading-[16px] text-muted-foreground">关闭沙盒时，命令仍受 TaskFrame 工作区、运行时长和输出大小限制，但不再使用操作系统级 SRT 隔离。</p>
+          {!sandboxLocked && <p className="text-[11px] leading-[16px] text-muted-foreground">关闭沙盒时，命令仍受 TaskFrame 工作区、运行时长和输出大小限制，但不再使用操作系统级 SRT 隔离。</p>}
           {updatedAt && <span className="text-[12px] text-muted-foreground">最后更新：{formatDateOnly(updatedAt)}</span>}
         </CardContent>
       </Card>
@@ -164,8 +169,8 @@ function LabeledField({ label, hint, children }: { label: string; hint?: string;
   return <label className="flex flex-col gap-[6px]"><span className="text-[12px] font-medium text-[#464c5e]">{label}</span>{hint && <span className="text-[11px] leading-[16px] text-muted-foreground">{hint}</span>}{children}</label>;
 }
 
-function SwitchRow({ label, hint, checked, onChange }: { label: string; hint?: string; checked: boolean; onChange: (next: boolean) => void }) {
-  return <label className="flex items-center justify-between gap-[16px]"><span><span className="block text-[12px] font-medium text-[#464c5e]">{label}</span>{hint && <span className="mt-[3px] block text-[11px] leading-[16px] text-muted-foreground">{hint}</span>}</span><Switch checked={checked} onCheckedChange={onChange} /></label>;
+function SwitchRow({ label, hint, checked, disabled = false, onChange }: { label: string; hint?: string; checked: boolean; disabled?: boolean; onChange: (next: boolean) => void }) {
+  return <label className="flex items-center justify-between gap-[16px]"><span><span className="block text-[12px] font-medium text-[#464c5e]">{label}</span>{hint && <span className="mt-[3px] block text-[11px] leading-[16px] text-muted-foreground">{hint}</span>}</span><Switch checked={checked} disabled={disabled} onCheckedChange={onChange} /></label>;
 }
 
 async function waitForApplicationRestart(): Promise<void> {
