@@ -188,7 +188,7 @@ def test_exec_command_builds_fixed_isolated_argv_and_structured_result(
     assert result.data["status"] == "completed"
     assert result.data["ok"] is True
     assert result.data["stdout"] == "done\n"
-    assert result.data["cwd"] == "/workspace"
+    assert result.data["cwd"] == "."
     assert result.data["sandbox"] == "bubblewrap"
     assert captured["cwd"] == workspace
     assert captured["timeout_seconds"] == 2
@@ -389,6 +389,31 @@ def test_exec_command_validates_every_line_of_multiline_script(tmp_path: Path) -
     assert result.success is False
     assert result.error is not None
     assert result.error.code == "COMMAND_DENIED"
+
+
+@pytest.mark.parametrize("command", ["tool 2>&1", "tool 1>&2"])
+def test_posix_validator_allows_standard_stream_merging(command: str) -> None:
+    command_module._validate_command(command)
+
+
+@pytest.mark.parametrize("command", ["tool 3>&1", "tool >&2", "tool 2<&1"])
+def test_posix_validator_rejects_other_file_descriptor_redirection(
+    command: str,
+) -> None:
+    with pytest.raises(HarnessExecutionError) as denied:
+        command_module._validate_command(command)
+
+    assert denied.value.error.code == "COMMAND_DENIED"
+    assert "2>&1" in denied.value.error.message
+
+
+def test_posix_validator_explains_how_to_replace_heredoc() -> None:
+    with pytest.raises(HarnessExecutionError) as denied:
+        command_module._validate_command("python3 - <<'PY'\nprint('x')\nPY")
+
+    assert denied.value.error.code == "COMMAND_DENIED"
+    assert "write_file" in denied.value.error.message
+    assert "work/" in denied.value.error.message
 
 
 def test_exec_command_rejects_workspace_symlinks_before_start(

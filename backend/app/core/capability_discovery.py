@@ -22,6 +22,7 @@ ALWAYS_EXPANDED_CAPABILITIES = {
     "capability_search",
     "capability_describe",
     "exec_command",
+    "current_datetime",
     "read_file",
     "extract_document_text",
     "write_file",

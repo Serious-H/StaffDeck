@@ -14,7 +14,6 @@ from app.core.harness_session_cleanup import (
     harness_task_workspace_path,
 )
 from app.harness.errors import HarnessExecutionError
-from app.harness.execution_context import SANDBOX_WORKSPACE
 from app.harness.workspace_files import (
     WORKSPACE_FILE_KIND_DERIVED,
     WORKSPACE_FILE_KIND_SOURCE,
@@ -91,14 +90,11 @@ def materialize_task_attachments(
                 )
         if staged_data is not None:
             relative_path = _input_attachment_relative_path(attachment, index)
-            sandbox_path = f"{SANDBOX_WORKSPACE}/{relative_path}"
             try:
                 _write_workspace_bytes(workspace, relative_path, staged_data)
                 descriptor.update(
                     {
-                        "workspace_path": sandbox_path,
-                        "workspace_relative_path": relative_path,
-                        "sandbox_path": sandbox_path,
+                        "path": relative_path,
                         "sha256": hashlib.sha256(staged_data).hexdigest(),
                         "materialized": True,
                         "note": "原始附件已写入当前 TaskFrame 沙箱。",
@@ -130,9 +126,7 @@ def materialize_task_attachments(
                         extracted_relative_path,
                         attachment.text.encode("utf-8"),
                     )
-                    descriptor["extracted_text_path"] = (
-                        f"{SANDBOX_WORKSPACE}/{extracted_relative_path}"
-                    )
+                    descriptor["extracted_text_path"] = extracted_relative_path
                     _attach_workspace_file_ref(
                         descriptor,
                         db=db,
@@ -153,15 +147,12 @@ def materialize_task_attachments(
                     )
         elif attachment.text:
             relative_path = _input_attachment_relative_path(attachment, index)
-            sandbox_path = f"{SANDBOX_WORKSPACE}/{relative_path}"
             try:
                 text_data = attachment.text.encode("utf-8")
                 _write_workspace_bytes(workspace, relative_path, text_data)
                 descriptor.update(
                     {
-                        "workspace_path": sandbox_path,
-                        "workspace_relative_path": relative_path,
-                        "sandbox_path": sandbox_path,
+                        "path": relative_path,
                         "sha256": hashlib.sha256(text_data).hexdigest(),
                         "materialized": True,
                         "note": (
@@ -380,7 +371,7 @@ def _input_attachment_relative_path(
     index: int,
 ) -> str:
     return "input/" + sandbox_attachment_path(attachment, index).removeprefix(
-        f"{SANDBOX_WORKSPACE}/"
+        "/workspace/"
     )
 
 

@@ -256,7 +256,7 @@ def exec_command(
         "output_truncated": process.output_truncated,
         "timeout_seconds": args.timeout_seconds,
         "duration_ms": process.duration_ms,
-        "cwd": SANDBOX_WORKSPACE,
+        "cwd": ".",
         "sandbox": backend,
         "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
     }
@@ -300,8 +300,9 @@ def register_command_tools(registry: HarnessRegistry) -> HarnessRegistry:
             "python3, py -3, or bash chaining); use PowerShell statements. In a "
             "packaged Windows build, python/python3 resolve to the bundled runtime; "
             "in source deployments, use the General Skill Python runtime. Relative "
-            "paths start in the TaskFrame workspace; absolute paths are accepted and "
-            "remain subject to OS permissions and the configured sandbox policy."
+            "paths start in the TaskFrame workspace. Prefer TaskFrame-relative paths "
+            "such as input/, work/, and output/; the legacy /workspace alias remains "
+            "accepted for compatibility."
         ),
         argument_model=ExecCommandArguments,
         handler=exec_command,
@@ -1116,9 +1117,26 @@ def _validate_command(command: str) -> None:
         raise _command_denied("Command cannot be empty.")
 
     words = [token for token in tokens if not _is_shell_operator(token)]
-    for token in tokens:
-        if token in {"<<", "<<<", "<&", ">&", "&>", "|&"}:
-            raise _command_denied("Unsafe shell redirection is not allowed.")
+    for index, token in enumerate(tokens):
+        if token in {"<<", "<<<"}:
+            raise _command_denied(
+                "Heredoc and here-string input are not allowed. Use write_file to "
+                "create a script under work/, then execute that file."
+            )
+        if token == ">&":
+            previous = tokens[index - 1] if index > 0 else ""
+            following = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if (previous, following) in {("2", "1"), ("1", "2")}:
+                continue
+            raise _command_denied(
+                "Unsafe file-descriptor redirection is not allowed. Only exact "
+                "2>&1 and 1>&2 stream merging is permitted."
+            )
+        if token in {"<&", "&>", "|&"}:
+            raise _command_denied(
+                "Unsafe file-descriptor redirection is not allowed. Only exact "
+                "2>&1 and 1>&2 stream merging is permitted."
+            )
         if "&" in token and token != "&&":
             raise _command_denied("Background processes are not allowed.")
     for token in words:

@@ -779,7 +779,7 @@ def test_task_request_compiler_builds_a_composite_requirement_without_outer_cont
             {
                 "attachment_id": "attachment-1",
                 "filename": "evidence.txt",
-                "workspace_path": "attachments/attachment-1-evidence.txt",
+                "path": "input/attachments/attachment-1-evidence.txt",
                 "materialized": True,
             }
         ],
@@ -805,7 +805,7 @@ def test_task_request_compiler_builds_a_composite_requirement_without_outer_cont
         {
             "attachment_id": "attachment-1",
             "filename": "evidence.txt",
-            "workspace_path": "attachments/attachment-1-evidence.txt",
+            "path": "input/attachments/attachment-1-evidence.txt",
             "materialized": True,
         }
     ]
@@ -934,10 +934,9 @@ def test_attachments_are_materialized_inside_only_the_task_workspace(
     )
 
     assert descriptors[0]["materialized"] is True
-    sandbox_path = str(descriptors[0]["workspace_path"])
-    assert sandbox_path.startswith("/workspace/input/attachments/")
-    assert ".." not in sandbox_path
-    relative_path = sandbox_path.removeprefix("/workspace/")
+    relative_path = str(descriptors[0]["path"])
+    assert relative_path.startswith("input/attachments/")
+    assert ".." not in relative_path
     assert (workspace / relative_path).read_text(encoding="utf-8") == "evidence"
     assert descriptors[1]["materialized"] is False
     assert not (workspace / "image.png").exists()
@@ -979,9 +978,9 @@ def test_staged_image_is_both_a_sandbox_file_and_vision_payload(
 
     assert descriptors[0]["materialized"] is True
     assert descriptors[0]["vision_available"] is True
-    sandbox_path = str(descriptors[0]["workspace_path"])
-    assert sandbox_path.startswith("/workspace/input/attachments/")
-    assert (workspace / sandbox_path.removeprefix("/workspace/")).read_bytes() == raw
+    relative_path = str(descriptors[0]["path"])
+    assert relative_path.startswith("input/attachments/")
+    assert (workspace / relative_path).read_bytes() == raw
     assert len(payloads) == 1
     assert payloads[0].data_url == attachment.data_url
 
@@ -1022,9 +1021,9 @@ def test_materialized_pdf_and_extracted_text_are_registered_as_session_files(
             )
         ).all()
 
-    assert descriptors[0]["workspace_path"].startswith("/workspace/input/")
+    assert descriptors[0]["path"].startswith("input/")
     assert descriptors[0]["workspace_file_ref"]["file_kind"] == "source"
-    assert descriptors[0]["extracted_text_path"].startswith("/workspace/input/")
+    assert descriptors[0]["extracted_text_path"].startswith("input/")
     assert descriptors[0]["extracted_text_file_ref"]["file_kind"] == "derived"
     assert {(record.logical_path, record.kind, record.visibility) for record in records} == {
         ("作业票.pdf", "source", "session"),
@@ -1245,6 +1244,16 @@ def test_windows_manifest_exposes_platform_shell_exec_command(monkeypatch) -> No
         manifest = CapabilityManifestBuilder(db).build("tenant-demo", None, None, None)
 
     assert "exec_command" in manifest.allowed_names()
+
+
+def test_manifest_exposes_trusted_current_datetime_capability() -> None:
+    engine = _test_engine()
+    with Session(engine) as db:
+        manifest = CapabilityManifestBuilder(db).build("tenant-demo", None, None, None)
+
+    descriptor = next(item for item in manifest.available if item.name == "current_datetime")
+    assert descriptor.capability_id == "builtin.time.current_datetime"
+    assert descriptor.metadata == {"provider": "builtin.time", "side_effect": "read"}
 
 
 def test_scheduled_harness_outcome_uses_taskframes_and_records_sop_scope() -> None:
@@ -1629,7 +1638,7 @@ def test_file_mutation_is_private_until_publish_artifact_succeeds(
     assert len(published["artifacts"]) == 1
     artifact = published["artifacts"][0]
     assert artifact["path"] == "output/reports/result.txt"
-    assert artifact["sandbox_path"] == "/workspace/output/reports/result.txt"
+    assert "sandbox_path" not in artifact
     assert artifact["workspace_file_ref"]["file_kind"] == "deliverable"
     assert artifact["workspace_file_ref"]["visibility"] == "session"
 
@@ -1712,11 +1721,11 @@ def test_later_taskframe_materializes_a_session_file_ref_into_its_input(
         )
         read_back = consumer.invoke(
             "read_file",
-            {"path": materialized["data"]["sandbox_path"]},
+            {"path": materialized["data"]["path"]},
         )
 
     assert materialized["success"] is True
-    assert materialized["data"]["sandbox_path"].startswith("/workspace/input/session/")
+    assert materialized["data"]["path"].startswith("input/session/")
     assert read_back["success"] is True
     assert read_back["data"]["content"] == '{"total": 3}'
 
@@ -1756,9 +1765,7 @@ def test_dependent_taskframe_receives_prior_declared_output_as_input(
 
     assert len(dependency_files) == 1
     assert dependency_files[0]["materialized"] is True
-    assert dependency_files[0]["sandbox_path"].startswith(
-        "/workspace/input/dependencies/"
-    )
+    assert dependency_files[0]["path"].startswith("input/dependencies/")
 
 
 def test_workspace_discovery_returns_source_and_generated_image(
@@ -1790,10 +1797,62 @@ def test_workspace_discovery_returns_source_and_generated_image(
         (invoker.workspace_root / "output" / "chart.png").write_bytes(b"png")
         artifacts = invoker.discover_artifacts()
 
-    assert written["data"]["path"] == "/workspace/work/generate_chart.py"
+    assert written["data"]["path"] == "work/generate_chart.py"
     assert [item["path"] for item in artifacts] == ["output/chart.png"]
-    assert [item["sandbox_path"] for item in artifacts] == ["/workspace/output/chart.png"]
+    assert all("sandbox_path" not in item for item in artifacts)
     assert artifacts[0]["workspace_file_ref"]["path"] == "chart.png"
+
+
+def test_exec_command_reports_created_and_modified_workspace_files(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("ULTRARAG_DATA_DIR", str(tmp_path / "data"))
+    engine = _test_engine()
+    with Session(engine) as db:
+        manifest = CapabilityManifestBuilder(db).build("tenant-demo", None, None, None)
+        invoker = HarnessCapabilityInvoker(
+            db,
+            tenant_id="tenant-demo",
+            session=_chat_session(),
+            task_frame_id="task-command-changes",
+            model_config=_model_config(),
+            manifest=manifest,
+            active_skill=None,
+            active_step_id=None,
+            agent_id=None,
+        )
+        existing = invoker.workspace_root / "work" / "plan.md"
+        existing.write_text("old", encoding="utf-8")
+
+        def fake_execute(_context, _call):
+            existing.write_text("updated", encoding="utf-8")
+            (invoker.workspace_root / "output" / "report.md").write_text(
+                "ready",
+                encoding="utf-8",
+            )
+            (invoker.workspace_root / "work" / "debug.log").write_text(
+                "noise",
+                encoding="utf-8",
+            )
+            return SimpleNamespace(
+                success=True,
+                data={"status": "completed", "ok": True},
+                duration_ms=3,
+            )
+
+        monkeypatch.setattr(invoker._file_executor, "execute", fake_execute)
+        result = invoker._invoke_file(
+            "exec_command",
+            {"command": "python3 work/process.py"},
+            call_id="hcall-command-changes",
+        )
+
+    assert result["success"] is True
+    assert result["data"]["workspace_changes"] == [
+        {"path": "output/report.md", "change": "created", "size": 5},
+        {"path": "work/plan.md", "change": "modified", "size": 7},
+    ]
 
 
 def test_large_external_json_result_uses_sandbox_reference_and_auto_resolves(
@@ -1896,9 +1955,12 @@ def test_large_external_json_result_uses_sandbox_reference_and_auto_resolves(
         reference = large_result["data"]
         read_result = invoker._invoke_file(
             "read_file",
-            {"path": reference["sandbox_path"]},
+            {"path": reference["path"]},
             call_id="hcall-read",
         )
+        legacy_reference = dict(reference)
+        legacy_reference["sandbox_path"] = f"/workspace/{legacy_reference.pop('path')}"
+        legacy_resolved = invoker._read_json_tool_result_reference(legacy_reference)
         sink_result = invoker._invoke_external_tool(
             sink_tool.id,
             metadata(sink_tool),
@@ -1910,18 +1972,15 @@ def test_large_external_json_result_uses_sandbox_reference_and_auto_resolves(
 
     assert large_result["success"] is True
     assert reference["kind"] == "sandbox_json_file"
-    assert reference["sandbox_path"] == (
-        "/workspace/.harness/tool-results/hcall-large.json"
-    )
-    assert reference["command_path"] == ".harness/tool-results/hcall-large.json"
+    assert reference["path"] == ".harness/tool-results/hcall-large.json"
     assert set(reference) == {
         "kind",
-        "sandbox_path",
-        "command_path",
+        "path",
         "size",
         "sha256",
     }
     assert json.loads(read_result["data"]["content"]) == large_data
+    assert legacy_resolved == large_data
     assert small_result["data"] == {"ok": True}
     assert sink_result["data"] == {"accepted": True}
     assert len(sink_arguments) == 1
@@ -2041,16 +2100,14 @@ def test_knowledge_search_large_json_result_uses_internal_sandbox_reference(
         reference = result["data"]
         read_result = invoker._invoke_file(
             "read_file",
-            {"path": reference["sandbox_path"]},
+            {"path": reference["path"]},
             call_id="hcall-read-knowledge",
         )
         artifacts = invoker.discover_artifacts()
 
     assert result["success"] is True
     assert reference["kind"] == "sandbox_json_file"
-    assert reference["sandbox_path"] == (
-        "/workspace/.harness/tool-results/hcall-knowledge.json"
-    )
+    assert reference["path"] == ".harness/tool-results/hcall-knowledge.json"
     assert json.loads(read_result["data"]["content"])["selected_concepts"] == large_payload
     assert artifacts == []
 
@@ -2754,9 +2811,9 @@ def test_harness_agent_enforces_tool_allowlist_and_keeps_an_isolated_transcript(
     assert "不会启动第二套 runner" in system_prompts[0]
     assert "Skill 负责提供工作流程" in system_prompts[0]
     assert "最终文件必须\n  明确写到 `output/<文件名>`" in system_prompts[0]
-    assert "`command_path` 是供临时脚本和" in system_prompts[0]
+    assert "`path` 是文件工具、exec_command 和临时脚本通用" in system_prompts[0]
     assert "不得\n  根据 `os.getcwd()`、宿主机路径或父目录推导" in system_prompts[0]
-    assert "不要在脚本中\n  使用 `sandbox_path`" in system_prompts[0]
+    assert "统一使用当前 TaskFrame 相对路径" in system_prompts[0]
     assert "不得对其调用 `copy_file`、" in system_prompts[0]
 
 

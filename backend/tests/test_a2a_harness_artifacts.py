@@ -39,4 +39,4 @@ def test_a2a_file_parts_become_harness_workspace_artifacts(tmp_path) -> None:
     file_part = payload["data"]["artifacts"][0]["parts"][0]["file"]
     assert "bytes" not in file_part
     assert file_part["path"] == artifacts[0]["path"]
-    assert file_part["sandbox_path"].endswith("/report.txt")
+    assert "sandbox_path" not in file_part

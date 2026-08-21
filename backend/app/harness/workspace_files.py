@@ -119,7 +119,6 @@ class MaterializedWorkspaceFile:
             "kind": "materialized_workspace_file",
             "ref_id": self.file_ref.id,
             "path": self.relative_path,
-            "sandbox_path": f"/workspace/{self.relative_path}",
             "sha256": self.file_ref.sha256,
             "size": self.file_ref.size,
             "content_type": self.file_ref.content_type,

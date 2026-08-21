@@ -57,6 +57,8 @@ class HarnessToolContext:
     sandbox_required: bool = False
     sandbox_network_mode: Literal["all", "allowlist", "deny"] = "all"
     sandbox_allowed_domains: tuple[str, ...] = ()
+    # Trusted request timezone used by time-aware built-in capabilities.
+    timezone: str = "Asia/Shanghai"
     # Direct/internal callers preserve the historical root-wide workspace
     # behavior. Harness v2 TaskFrames opt in to the input/work/output policy.
     enforce_task_workspace_layout: bool = False
