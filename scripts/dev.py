@@ -242,8 +242,18 @@ def _ensure_sandbox_runtime() -> None:
         if node.is_file() and cli.is_file() and all(
             marker in path.read_text(encoding="utf-8") for path, marker in markers
         ):
-            return
+            probe = subprocess.run(
+                [str(node), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            if probe.returncode == 0 and probe.stdout.strip().lower().startswith("v"):
+                return
     except OSError:
+        pass
+    except subprocess.SubprocessError:
         pass
     print("Preparing the reviewed StaffDeck sandbox runtime...")
     subprocess.run(

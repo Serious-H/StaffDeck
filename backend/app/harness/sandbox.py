@@ -25,6 +25,13 @@ class SandboxDiagnostics:
 
 SandboxNetworkMode = Literal["all", "allowlist", "deny"]
 
+_LINUX_SANDBOX_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+_LINUX_SRT_DEPENDENCIES = {
+    "rg": "ripgrep",
+    "socat": "socat",
+    "bwrap": "bubblewrap",
+}
+
 
 def parse_network_policy(value: object | None) -> SandboxNetworkMode:
     if value is None or str(value).strip() == "":
@@ -77,6 +84,30 @@ def _environment_diagnostics(backend: str) -> SandboxDiagnostics:
                 "请启用 kernel.unprivileged_userns_clone=1，"
                 "并将 user.max_user_namespaces 设置为大于 0。",
             )
+        if backend == "srt":
+            missing = [
+                package
+                for executable, package in _LINUX_SRT_DEPENDENCIES.items()
+                if not _trusted_system_executable(executable)
+            ]
+            if missing:
+                packages = " ".join(missing)
+                return SandboxDiagnostics(
+                    "unavailable",
+                    "SANDBOX_DEPENDENCY_MISSING",
+                    "SRT 缺少 Linux 系统依赖：" + "、".join(missing) + "。",
+                    f"Debian/Ubuntu 请执行：sudo apt-get install -y {packages}",
+                    backend=backend,
+                )
+            resolved = resolve_srt()
+            if resolved is None or not _linux_srt_ready(*resolved):
+                return SandboxDiagnostics(
+                    "unavailable",
+                    "SANDBOX_SRT_PROBE_FAILED",
+                    "SRT 最小执行探测失败，已禁止任务命令在宿主机直接运行。",
+                    "请检查 user namespace、临时目录权限和 SRT 运行日志。",
+                    backend=backend,
+                )
     if sys.platform == "win32" and backend == "srt":
         resolved = resolve_srt()
         if resolved is None or not _windows_srt_ready(*resolved):
@@ -129,6 +160,60 @@ def _windows_srt_ready(node: Path, cli: Path) -> bool:
                 capture_output=True,
                 timeout=20,
                 check=False,
+            )
+            return completed.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+@lru_cache(maxsize=4)
+def _linux_srt_ready(node: Path, cli: Path) -> bool:
+    """Run one real, network-denied command to validate the Linux sandbox."""
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="sd-probe-") as raw_dir:
+            settings = Path(raw_dir) / "settings.json"
+            settings.write_text(
+                json.dumps(
+                    {
+                        "filesystem": {
+                            "denyRead": [],
+                            "allowRead": [raw_dir],
+                            "allowWrite": [raw_dir],
+                            "denyWrite": [],
+                        },
+                        "network": {
+                            "allowedDomains": [],
+                            "deniedDomains": ["*"],
+                            "strictAllowlist": True,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    str(node),
+                    str(cli),
+                    "--settings",
+                    str(settings),
+                    "/bin/bash",
+                    "--noprofile",
+                    "--norc",
+                    "-c",
+                    "exit 0",
+                ],
+                cwd=raw_dir,
+                capture_output=True,
+                timeout=20,
+                check=False,
+                env={
+                    "PATH": _LINUX_SANDBOX_PATH,
+                    "HOME": raw_dir,
+                    "TMPDIR": raw_dir,
+                    "LANG": "C.UTF-8",
+                    "LC_ALL": "C.UTF-8",
+                },
             )
             return completed.returncode == 0
     except (OSError, subprocess.SubprocessError):
@@ -216,7 +301,18 @@ def resolve_srt() -> tuple[Path, Path] | None:
         # actual dist/cli.js entrypoint.
         candidates.append((Path(node), Path(srt).resolve()))
     for node_path, cli_path in candidates:
-        if node_path.is_file() and cli_path.is_file() and os.access(node_path, os.X_OK):
+        try:
+            metadata = node_path.stat()
+        except OSError:
+            continue
+        if (
+            node_path.is_file()
+            and cli_path.is_file()
+            and os.access(node_path, os.X_OK)
+            and _node_runtime_healthy(
+                node_path.resolve(), metadata.st_mtime_ns, metadata.st_size
+            )
+        ):
             return node_path.resolve(), cli_path.resolve()
     return None
 
@@ -248,6 +344,34 @@ def _trusted_executable(name: str) -> bool:
         return path.is_absolute() and path.is_file() and os.access(path, os.X_OK)
     except OSError:
         return False
+
+
+def _trusted_system_executable(name: str) -> bool:
+    executable = shutil.which(name, path=_LINUX_SANDBOX_PATH)
+    if not executable:
+        return False
+    path = Path(executable)
+    try:
+        return path.is_absolute() and path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+@lru_cache(maxsize=16)
+def _node_runtime_healthy(node: Path, modified_ns: int, size: int) -> bool:
+    del modified_ns, size
+    try:
+        completed = subprocess.run(
+            [str(node), "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+            env={"PATH": _LINUX_SANDBOX_PATH} if sys.platform.startswith("linux") else None,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and completed.stdout.strip().lower().startswith("v")
 
 
 __all__ = [

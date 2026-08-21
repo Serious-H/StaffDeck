@@ -11,7 +11,7 @@ from app.harness.errors import HarnessExecutionError
 def _make_bundle(root: Path) -> None:
     (root / "bin").mkdir(parents=True)
     node = root / "bin" / sandbox._node_name()
-    node.write_bytes(b"node")
+    node.write_text("#!/bin/sh\necho v22.0.0\n", encoding="utf-8")
     node.chmod(0o755)
     cli = root / "node_modules" / "@anthropic-ai" / "sandbox-runtime" / "dist"
     cli.mkdir(parents=True)
@@ -26,6 +26,22 @@ def test_resolve_srt_uses_explicit_bundle(monkeypatch, tmp_path: Path) -> None:
         (tmp_path / "bin" / sandbox._node_name()).resolve(),
         (tmp_path / "node_modules/@anthropic-ai/sandbox-runtime/dist/cli.js").resolve(),
     )
+
+
+def test_resolve_srt_rejects_node_that_cannot_execute(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _make_bundle(tmp_path)
+    node = tmp_path / "bin" / sandbox._node_name()
+    node.write_text("#!/bin/sh\nexit 7\n", encoding="utf-8")
+    monkeypatch.setenv("STAFFDECK_SRT_RUNTIME", str(tmp_path))
+    monkeypatch.setattr(sandbox, "_source_runtime_root", lambda: tmp_path / "missing")
+    sandbox._node_runtime_healthy.cache_clear()
+
+    try:
+        assert sandbox.resolve_srt() is None
+    finally:
+        sandbox._node_runtime_healthy.cache_clear()
 
 
 def test_resolve_srt_prefers_source_bundle_over_global_install(
@@ -159,6 +175,46 @@ def test_diagnostics_rejects_disabled_user_namespaces(monkeypatch, tmp_path: Pat
 
     assert report.status == "unavailable"
     assert report.code == "SANDBOX_USERNS_DISABLED"
+
+
+def test_linux_srt_diagnostics_reports_missing_system_dependencies(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _make_bundle(tmp_path)
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "geteuid", lambda: 1001, raising=False)
+    monkeypatch.setattr(sandbox, "available_backend", lambda: "srt")
+    monkeypatch.setattr(sandbox, "_read_int", lambda _path: 100)
+    monkeypatch.setattr(
+        sandbox,
+        "_trusted_system_executable",
+        lambda name: name == "bwrap",
+    )
+
+    report = sandbox.diagnostics()
+
+    assert report.status == "unavailable"
+    assert report.code == "SANDBOX_DEPENDENCY_MISSING"
+    assert "ripgrep" in report.message
+    assert "socat" in report.message
+
+
+def test_linux_srt_diagnostics_requires_successful_probe(
+    monkeypatch, tmp_path: Path
+) -> None:
+    _make_bundle(tmp_path)
+    monkeypatch.setattr(sandbox.sys, "platform", "linux")
+    monkeypatch.setattr(sandbox.os, "geteuid", lambda: 1001, raising=False)
+    monkeypatch.setattr(sandbox, "available_backend", lambda: "srt")
+    monkeypatch.setattr(sandbox, "_read_int", lambda _path: 100)
+    monkeypatch.setattr(sandbox, "_trusted_system_executable", lambda _name: True)
+    monkeypatch.setattr(sandbox, "resolve_srt", lambda: (tmp_path / "node", tmp_path / "cli"))
+    monkeypatch.setattr(sandbox, "_linux_srt_ready", lambda *_args: False)
+
+    report = sandbox.diagnostics()
+
+    assert report.status == "unavailable"
+    assert report.code == "SANDBOX_SRT_PROBE_FAILED"
 
 
 def test_windows_diagnostics_requires_successful_srt_initialization(

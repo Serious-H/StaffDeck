@@ -484,6 +484,56 @@ def test_governed_srt_settings_write_only_task_work_and_output(
     # The TaskFrame is read-only as a whole.  The SRT runtime then overlays
     # the explicitly governed work/ and output/ child directories as writable.
     assert filesystem["allowRead"][0] == str(workspace)
+    assert str(Path.home()) in filesystem["denyRead"]
+
+
+def test_governed_command_receives_shared_task_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, object] = {}
+    runtime_root = tmp_path / "runtime"
+    runtime_root.mkdir()
+    runtime = SimpleNamespace(
+        environment={
+            "PATH": f"{runtime_root / 'bin'}:/usr/bin:/bin",
+            "VIRTUAL_ENV": str(runtime_root),
+            "GENERAL_SKILL_RUNTIME_PYTHON": str(runtime_root / "bin/python3"),
+        },
+        readonly_roots=(runtime_root,),
+    )
+    monkeypatch.setattr(command_module, "resolve_task_execution_runtime", lambda: runtime)
+    monkeypatch.setattr(command_module, "available_backend", lambda: "bubblewrap")
+    monkeypatch.setattr(command_module, "ensure_backend_usable", lambda _backend: None)
+    monkeypatch.setattr(command_module, "_bubblewrap_executable", lambda: "/usr/bin/bwrap")
+
+    def fake_run(argv, **kwargs):
+        captured["argv"] = list(argv)
+        captured["env"] = kwargs.get("env")
+        return command_module._BoundedProcessResult(
+            returncode=0,
+            stdout=b"ok\n",
+            stderr=b"",
+            stdout_bytes=3,
+            stderr_bytes=0,
+            timed_out=False,
+            output_truncated=False,
+            duration_ms=1,
+        )
+
+    monkeypatch.setattr(command_module, "_run_bounded_process", fake_run)
+
+    result = _execute(
+        tmp_path,
+        {"command": "python3 --version"},
+        enforce_task_workspace_layout=True,
+    )
+
+    assert result.success is True
+    assert captured["env"]["PATH"] == runtime.environment["PATH"]
+    argv = captured["argv"]
+    assert [str(runtime_root), str(runtime_root)] in _all_option_pairs(argv, "--ro-bind")
+    path_positions = [index for index, value in enumerate(argv) if value == "PATH"]
+    assert argv[path_positions[-1] + 1] == runtime.environment["PATH"]
 
 
 def test_governed_bubblewrap_blocks_task_root_writes_when_available(
@@ -494,6 +544,11 @@ def test_governed_bubblewrap_blocks_task_root_writes_when_available(
     if not sys.platform.startswith("linux") or not command_module.shutil.which("bwrap"):
         pytest.skip("Bubblewrap is unavailable in this test environment.")
     monkeypatch.setattr(command_module, "available_backend", lambda: "bubblewrap")
+    monkeypatch.setattr(
+        command_module,
+        "resolve_task_execution_runtime",
+        lambda: SimpleNamespace(environment={}, readonly_roots=()),
+    )
 
     result = _execute(
         tmp_path,
@@ -531,6 +586,12 @@ def test_governed_srt_allows_task_output_under_protected_data_root(
     workspace.mkdir(parents=True)
     monkeypatch.setenv("ULTRARAG_DATA_DIR", str(data_root))
     monkeypatch.setattr(command_module, "available_backend", lambda: "srt")
+    monkeypatch.setattr(command_module, "ensure_backend_usable", lambda _backend: None)
+    monkeypatch.setattr(
+        command_module,
+        "resolve_task_execution_runtime",
+        lambda: SimpleNamespace(environment={}, readonly_roots=()),
+    )
 
     result = _execute(
         tmp_path,
@@ -547,8 +608,12 @@ def test_governed_srt_allows_task_output_under_protected_data_root(
 
     assert result.success is True
     assert result.data is not None
+    if "listen EPERM" in str(result.data.get("stderr") or ""):
+        pytest.skip("The outer test sandbox blocks SRT Unix sockets.")
     assert result.data["status"] == "failed", result.data["stderr"]
-    assert (workspace / "output" / "permitted.txt").read_text() == "permitted"
+    permitted_file = workspace / "output" / "permitted.txt"
+    assert permitted_file.exists(), result.data["stderr"]
+    assert permitted_file.read_text() == "permitted"
     assert not (workspace / "root-must-not-be-writable.txt").exists()
 
 

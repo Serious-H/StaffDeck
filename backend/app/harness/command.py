@@ -32,6 +32,7 @@ from app.harness.sandbox import (
     require_backend,
     resolve_srt,
 )
+from app.harness.task_runtime import resolve_task_execution_runtime
 from app.harness.workspace_layout import ensure_task_workspace_layout
 from app.security.managed_subprocess import ManagedProcess, ManagedProcessError
 
@@ -149,6 +150,13 @@ def exec_command(
         if context.enforce_task_workspace_layout
         else {}
     )
+    task_runtime = (
+        resolve_task_execution_runtime()
+        if context.enforce_task_workspace_layout
+        else None
+    )
+    runtime_environment = dict(task_runtime.environment) if task_runtime is not None else {}
+    runtime_roots = task_runtime.readonly_roots if task_runtime is not None else ()
     sandbox_enabled = context.sandbox_enabled or context.sandbox_required
     backend = available_backend() if sandbox_enabled else "unsandboxed"
     # Keep the existing Bubblewrap seam patchable for unit tests and Linux
@@ -195,6 +203,7 @@ def exec_command(
                 allowed_domains=context.sandbox_allowed_domains,
                 sandbox_temp=sandbox_temp_path,
                 restrict_to_task_workspace_layout=context.enforce_task_workspace_layout,
+                extra_readonly_paths=runtime_roots,
             )
             argv = _srt_argv(settings_path=settings_path, command=command)
         else:
@@ -205,7 +214,8 @@ def exec_command(
                 workspace=workspace,
                 command=command,
                 backend=backend,
-                env=None,
+                env=runtime_environment,
+                extra_readonly_paths=runtime_roots,
                 network_mode=context.sandbox_network_mode,
                 restrict_to_task_workspace_layout=context.enforce_task_workspace_layout,
             )
@@ -214,7 +224,7 @@ def exec_command(
             "timeout_seconds": args.timeout_seconds,
             "output_limit": output_limit,
         }
-        process_env = dict(task_environment)
+        process_env = {**task_environment, **runtime_environment}
         if sandbox_temp_path is not None:
             process_env["TMPDIR"] = str(sandbox_temp_path)
         if process_env:
@@ -394,15 +404,19 @@ def run_sandboxed_process(
             runtime_roots: list[Path] = []
             for item in argv:
                 candidate = Path(str(item))
-                if candidate.is_absolute() and candidate.exists():
+                if (
+                    candidate.is_absolute()
+                    and candidate.exists()
+                    and candidate.name
+                    in {"python", "python3", "python.exe", "node", "node.exe"}
+                ):
                     # Expose only the runtime installation containing a fixed
                     # interpreter; the generated runner itself lives inside
                     # the workspace and needs no extra mount.
-                    if candidate.name in {"python", "python3", "python.exe", "node", "node.exe"}:
-                        resolved_candidate = candidate.resolve()
-                        runtime_roots.extend(
-                            (candidate.parent.parent, resolved_candidate.parent.parent)
-                        )
+                    resolved_candidate = candidate.resolve()
+                    runtime_roots.extend(
+                        (candidate.parent.parent, resolved_candidate.parent.parent)
+                    )
             sandbox_argv = _bubblewrap_argv(
                 sandbox_executable=(
                     _bubblewrap_executable()
@@ -578,6 +592,7 @@ def _write_srt_settings(
     allowed_domains: tuple[str, ...] = (),
     sandbox_temp: Path | None = None,
     restrict_to_task_workspace_layout: bool = False,
+    extra_readonly_paths: tuple[Path, ...] = (),
 ) -> Path:
     if network_mode not in {"all", "allowlist", "deny"}:
         raise HarnessExecutionError("SANDBOX_POLICY_INVALID", "Unknown sandbox network policy.")
@@ -602,6 +617,25 @@ def _write_srt_settings(
     protected_paths: list[str] = []
     if sys.platform != "win32":
         protected_paths.extend(("~/.ssh", "~/.aws", "~/.config"))
+        if restrict_to_task_workspace_layout:
+            # Platform TaskFrames may read their own workspace and explicitly
+            # mounted runtimes, but not unrelated user or service data.
+            protected_paths.extend(
+                str(path)
+                for path in (
+                    Path.home(),
+                    Path("/root"),
+                    Path("/srv"),
+                    Path("/opt"),
+                    Path("/mnt"),
+                    Path("/media"),
+                    Path("/tmp"),
+                    Path("/var/tmp"),
+                    Path("/var/lib"),
+                    Path("/var/log"),
+                )
+                if path.exists()
+            )
         # Protect the service's local persistence and data directory even when
         # a generated skill guesses an absolute host path.
         database_bases = [
@@ -635,6 +669,7 @@ def _write_srt_settings(
     runtime_root = _bundled_runtime_root()
     if runtime_root is not None:
         allow_read.append(str(runtime_root))
+    allow_read.extend(str(path.resolve()) for path in extra_readonly_paths)
     if sandbox_temp is not None:
         resolved_temp = str(sandbox_temp.resolve(strict=True))
         allow_read.append(resolved_temp)
@@ -845,6 +880,7 @@ def _bubblewrap_argv(
         ]
         home_directory = f"{SANDBOX_WORKSPACE}/work/.home"
         temp_directory = f"{SANDBOX_WORKSPACE}/work/.tmp"
+    sandbox_path = str((env or {}).get("PATH") or _SANDBOX_PATH)
     argv.extend(
         (
             "--proc",
@@ -871,7 +907,7 @@ def _bubblewrap_argv(
             temp_directory,
             "--setenv",
             "PATH",
-            _SANDBOX_PATH,
+            sandbox_path,
             "--setenv",
             "LANG",
             "C.UTF-8",
@@ -885,7 +921,8 @@ def _bubblewrap_argv(
         for key, value in (env or {}).items()
         if key in {
             "ARGUMENTS", "QUERY", "SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_SLUG", "SKILL_NAME",
-            "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT",
+            "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT", "VIRTUAL_ENV",
+            "GENERAL_SKILL_RUNTIME_PYTHON", "GENERAL_SKILL_RUNTIME_NODE", "PYTHONUNBUFFERED",
         }
     }
     for key, value in allowed_env.items():
@@ -926,6 +963,8 @@ def _managed_process_environment(env: dict[str, str] | None) -> dict[str, str]:
             "PATH", "HOME", "PWD", "TMPDIR", "LANG", "LC_ALL",
             "ARGUMENTS", "QUERY", "SKILL_WORKSPACE", "ARTIFACT_DIR", "SKILL_SLUG",
             "SKILL_NAME", "USER_ID", "SKILL_FILES_JSON", "SSL_CERT_FILE", "PIP_CERT",
+            "VIRTUAL_ENV", "GENERAL_SKILL_RUNTIME_PYTHON", "GENERAL_SKILL_RUNTIME_NODE",
+            "PYTHONUNBUFFERED",
         }
     }
     return {**baseline, **allowed}
