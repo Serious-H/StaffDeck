@@ -98,6 +98,12 @@ def _agent_id_or_none(agent_id: object | None) -> str | None:
     return agent_id if isinstance(agent_id, str) and agent_id else None
 
 
+def _saved_general_skill_status(status: str) -> str:
+    """Treat every saved skill as a persisted skill, not a database draft."""
+
+    return "archived" if status == "archived" else "published"
+
+
 def general_skill_read(
     row: GeneralSkill,
     status_override: str | None = None,
@@ -160,6 +166,7 @@ def import_general_skill(
     agent_id = _agent_id_or_none(request.agent_id)
     agent = ensure_agent_scope_manager(db, request.tenant_id, agent_id, current_user)
     is_private_agent_scope = bool(agent and not agent.is_overall)
+    saved_status = _saved_general_skill_status(request.status)
     if not is_private_agent_scope:
         ensure_open_gallery_admin(request.tenant_id, current_user)
     row = None
@@ -242,7 +249,7 @@ def import_general_skill(
         row.skill_markdown = markdown
         row.skill_files_json = [file.model_dump(mode="json") for file in files]
         row.metadata_json = metadata
-        row.status = request.status
+        row.status = "published" if is_private_agent_scope else saved_status
         if request.capability_scope is not None:
             row.capability_scope = request.capability_scope
         row.updated_at = now
@@ -258,7 +265,7 @@ def import_general_skill(
             skill_markdown=markdown,
             skill_files_json=[file.model_dump(mode="json") for file in files],
             metadata_json=metadata,
-            status=request.status,
+            status="published" if is_private_agent_scope else saved_status,
             capability_scope=normalize_capability_scope(
                 request.capability_scope or inherited_capability_scope
             ),
@@ -280,7 +287,7 @@ def import_general_skill(
             agent.id,
             "general_skill",
             row.id,
-            "active" if request.status == "published" else "inactive",
+            "active" if saved_status == "published" else "inactive",
             metadata_json=metadata,
             revive=True,
         )
@@ -290,12 +297,15 @@ def import_general_skill(
             request.tenant_id,
             "general_skill",
             row.id,
-            "active" if request.status == "published" else "inactive",
+            "active" if saved_status == "published" else "inactive",
             metadata_json=metadata,
         )
     db.commit()
     db.refresh(row)
-    return general_skill_read(row)
+    return general_skill_read(
+        row,
+        status_override=saved_status if is_private_agent_scope else None,
+    )
 
 
 @router.post("/import-skillhub", response_model=GeneralSkillRead)
@@ -449,6 +459,7 @@ def _create_imported_general_skill(
     resolved_agent_id = _agent_id_or_none(agent_id)
     agent = ensure_agent_scope_manager(db, tenant_id, resolved_agent_id, current_user)
     is_private_agent_scope = bool(agent and not agent.is_overall)
+    saved_status = _saved_general_skill_status(status)
     if not is_private_agent_scope:
         ensure_open_gallery_admin(tenant_id, current_user)
     existing = db.exec(
@@ -477,7 +488,7 @@ def _create_imported_general_skill(
         row.skill_markdown = markdown
         row.skill_files_json = [file.model_dump(mode="json") for file in files]
         row.metadata_json = metadata_preserving_creator(row.metadata_json, import_metadata)
-        row.status = status
+        row.status = "published" if is_private_agent_scope else saved_status
         row.capability_scope = normalize_capability_scope(capability_scope)
         row.updated_at = now
     else:
@@ -490,7 +501,7 @@ def _create_imported_general_skill(
             skill_markdown=markdown,
             skill_files_json=[file.model_dump(mode="json") for file in files],
             metadata_json=user_creator_metadata(current_user, import_metadata),
-            status=status,
+            status="published" if is_private_agent_scope else saved_status,
             capability_scope=normalize_capability_scope(capability_scope),
             permissions_json={"network": True, "python": True},
             runtime_config_json={"runtime": "python", "timeout_seconds": 12},
@@ -510,7 +521,7 @@ def _create_imported_general_skill(
             agent.id,
             "general_skill",
             row.id,
-            "active" if status == "published" else "inactive",
+            "active" if saved_status == "published" else "inactive",
             metadata_json=row.metadata_json or {},
             revive=True,
         )
@@ -520,12 +531,15 @@ def _create_imported_general_skill(
             tenant_id,
             "general_skill",
             row.id,
-            "active" if status == "published" else "inactive",
+            "active" if saved_status == "published" else "inactive",
             metadata_json=row.metadata_json or {},
         )
     db.commit()
     db.refresh(row)
-    return general_skill_read(row)
+    return general_skill_read(
+        row,
+        status_override=saved_status if is_private_agent_scope else None,
+    )
 
 
 @router.get(
@@ -575,8 +589,6 @@ def list_general_skills(
                     status_override=(
                         "published"
                         if binding.status == "active" and row.status == "published"
-                        else "draft"
-                        if row.status == "draft"
                         else "archived"
                     ),
                     can_permanent_delete=_can_permanently_delete_private_general_skill(
@@ -620,6 +632,18 @@ def publish_general_skill(
     agent_id = _agent_id_or_none(agent_id)
     agent = ensure_agent_scope_manager(db, tenant_id, agent_id, current_user)
     if agent and not agent.is_overall:
+        _ensure_general_skill_visible(db, tenant_id, row, agent.id)
+        if row.status != "published":
+            if is_open_gallery_resource(db, tenant_id, "general_skill", row):
+                raise HTTPException(
+                    status_code=409,
+                    detail="General skill is not enabled in the open gallery",
+                )
+            if not _general_skill_editable_by_agent(db, tenant_id, agent.id, row):
+                raise HTTPException(status_code=403, detail="General skill is not editable")
+            row.status = "published"
+            row.updated_at = utc_now()
+            db.add(row)
         binding = _ensure_general_skill_binding(
             db,
             tenant_id,
@@ -631,6 +655,7 @@ def publish_general_skill(
         binding.updated_at = utc_now()
         db.add(binding)
         db.commit()
+        db.refresh(row)
         return general_skill_read(row, status_override="published")
     ensure_open_gallery_admin(tenant_id, current_user)
     row.status = "published"

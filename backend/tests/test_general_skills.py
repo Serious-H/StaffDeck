@@ -735,7 +735,7 @@ def test_direct_package_upload_reports_slug_conflict_instead_of_creating_a_suffi
         db.commit()
         first = import_general_skill_package(request, db, _admin_user())
         assert first.slug == "duplicate-skill"
-        assert first.status == "draft"
+        assert first.status == "published"
 
         with pytest.raises(HTTPException) as error:
             import_general_skill_package(request, db, _admin_user())
@@ -793,7 +793,120 @@ def test_package_reimport_restores_removed_private_skill_without_a_suffix() -> N
         assert restored.slug == "private-upload-skill"
         assert restored.skill_markdown.rstrip().endswith("# 更新版本")
         rows = list_general_skills("tenant_demo", db, agent_id="agent_branch")
-        assert [(row.id, row.status) for row in rows] == [(imported.id, "draft")]
+        assert [(row.id, row.status) for row in rows] == [(imported.id, "published")]
+
+
+def test_enabling_legacy_private_draft_persists_published_status() -> None:
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_branch", tenant_id="tenant_demo", name="研发员工", is_overall=False
+            )
+        )
+        db.commit()
+
+        imported = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                agent_id="agent_branch",
+                name="历史草稿技能",
+                slug="legacy-draft-skill",
+                markdown="# 历史草稿技能\n",
+                status="archived",
+            ),
+            db,
+            _admin_user(),
+        )
+        persisted = db.get(GeneralSkill, imported.id)
+        assert persisted is not None
+        persisted.status = "draft"
+        db.add(persisted)
+        db.commit()
+
+        published = publish_general_skill(
+            imported.slug,
+            "tenant_demo",
+            db,
+            agent_id="agent_branch",
+            current_user=_admin_user(),
+        )
+
+        assert published.status == "published"
+        persisted = db.get(GeneralSkill, imported.id)
+        assert persisted is not None
+        assert persisted.status == "published"
+        rows = list_general_skills("tenant_demo", db, agent_id="agent_branch")
+        assert [(row.id, row.status) for row in rows] == [(imported.id, "published")]
+
+
+def test_saving_archived_private_skill_does_not_reenable_binding() -> None:
+    with _test_session() as db:
+        _seed_minimal_tenant(db)
+        db.add(
+            AgentProfile(
+                id="agent_overall", tenant_id="tenant_demo", name="开放广场", is_overall=True
+            )
+        )
+        db.add(
+            AgentProfile(
+                id="agent_branch", tenant_id="tenant_demo", name="研发员工", is_overall=False
+            )
+        )
+        db.commit()
+
+        imported = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                agent_id="agent_branch",
+                name="已启用技能",
+                slug="archived-private-skill",
+                markdown="# 初始内容\n",
+            ),
+            db,
+            _admin_user(),
+        )
+        archive_general_skill(
+            imported.slug,
+            "tenant_demo",
+            db,
+            agent_id="agent_branch",
+            current_user=_admin_user(),
+        )
+
+        saved = import_general_skill(
+            GeneralSkillImportRequest(
+                tenant_id="tenant_demo",
+                agent_id="agent_branch",
+                name="已停用技能的新内容",
+                slug=imported.slug,
+                original_slug=imported.slug,
+                markdown="# 更新内容\n",
+                status="archived",
+            ),
+            db,
+            _admin_user(),
+        )
+
+        assert saved.status == "archived"
+        persisted = db.get(GeneralSkill, imported.id)
+        assert persisted is not None
+        assert persisted.status == "published"
+        binding = db.exec(
+            select(AgentResourceBinding).where(
+                AgentResourceBinding.agent_id == "agent_branch",
+                AgentResourceBinding.resource_type == "general_skill",
+                AgentResourceBinding.resource_id == imported.id,
+            )
+        ).one()
+        assert binding.status == "inactive"
+        rows = list_general_skills("tenant_demo", db, agent_id="agent_branch")
+        assert [(row.id, row.status) for row in rows] == [(imported.id, "archived")]
 
 
 def test_permanently_delete_private_skill_releases_slug() -> None:

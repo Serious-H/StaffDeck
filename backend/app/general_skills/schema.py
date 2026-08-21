@@ -50,7 +50,7 @@ class GeneralSkillPackageUploadRequest(BaseModel):
     slug: Optional[str] = None
     description: Optional[str] = None
     homepage: Optional[str] = None
-    status: str = "draft"
+    status: str = "published"
     capability_scope: CapabilityScope = "general"
 
 
