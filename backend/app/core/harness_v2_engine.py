@@ -845,6 +845,7 @@ class HarnessV2Engine:
                 ),
                 trace_sink=trace,
                 step_deadline_monotonic=step_deadline_monotonic,
+                client_timezone=request.client_timezone,
             )
 
             result = self.task_agent.run(

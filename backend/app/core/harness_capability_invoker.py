@@ -58,9 +58,11 @@ from app.harness import (
     HarnessToolCall,
     HarnessToolContext,
     build_file_tool_registry,
+    is_noise_artifact_path,
     open_harness_artifact,
     publish_changed_harness_artifacts,
     register_command_tools,
+    register_time_tools,
     snapshot_harness_workspace,
 )
 from app.harness.errors import HarnessExecutionError
@@ -109,6 +111,7 @@ class HarnessCapabilityInvoker:
         ensure_execution_lease: Any | None = None,
         trace_sink: Callable[[str, dict[str, Any]], None] | None = None,
         step_deadline_monotonic: float | None = None,
+        client_timezone: str | None = None,
     ) -> None:
         self.db = db
         self.tenant_id = tenant_id
@@ -153,6 +156,7 @@ class HarnessCapabilityInvoker:
         )
         self._file_registry = build_file_tool_registry()
         register_command_tools(self._file_registry)
+        register_time_tools(self._file_registry)
         self._file_executor = HarnessExecutor(self._file_registry)
         self._file_context = HarnessToolContext(
             run_id=self.run_id,
@@ -163,6 +167,7 @@ class HarnessCapabilityInvoker:
             sandbox_required=sandbox_required,
             sandbox_network_mode=sandbox_mode,
             sandbox_allowed_domains=sandbox_domains,
+            timezone=str(client_timezone or "Asia/Shanghai").strip() or "Asia/Shanghai",
             enforce_task_workspace_layout=True,
         )
         self._sandbox_network_mode = sandbox_mode
@@ -325,7 +330,6 @@ class HarnessCapabilityInvoker:
             display_name = Path(relative_path).name
             item.update(
                 {
-                    "sandbox_path": _sandbox_path(relative_path),
                     "display_name": display_name,
                     "content_type": (
                         mimetypes.guess_type(display_name)[0]
@@ -485,6 +489,12 @@ class HarnessCapabilityInvoker:
         *,
         call_id: str,
     ) -> dict[str, Any]:
+        workspace_before = None
+        if name == "exec_command":
+            try:
+                workspace_before = snapshot_harness_workspace(self.workspace_root)
+            except (HarnessArtifactAccessError, OSError):
+                workspace_before = None
         result = self._file_executor.execute(
             self._file_context,
             HarnessToolCall(
@@ -495,6 +505,15 @@ class HarnessCapabilityInvoker:
         )
         if result.success:
             data = dict(result.data or {})
+            if name == "exec_command" and workspace_before is not None:
+                changes, truncated = _workspace_changes(
+                    self.workspace_root,
+                    workspace_before,
+                )
+                if changes is not None:
+                    data["workspace_changes"] = changes
+                    if truncated:
+                        data["workspace_changes_truncated"] = True
             artifacts: list[dict[str, Any]] = []
             if name == "publish_artifact":
                 artifact_path = str(data.get("path") or "").strip()
@@ -503,7 +522,6 @@ class HarnessCapabilityInvoker:
                         "type": "workspace_file",
                         "task_frame_id": self.task_frame_id,
                         "path": artifact_path,
-                        "sandbox_path": _sandbox_path(artifact_path),
                         "sha256": data.get("sha256"),
                         "size": data.get("size"),
                         "display_name": data.get("display_name"),
@@ -525,7 +543,7 @@ class HarnessCapabilityInvoker:
                 )
             return {
                 "success": True,
-                "data": _model_visible_file_result(data),
+                "data": data,
                 "artifacts": artifacts,
                 "duration_ms": result.duration_ms,
             }
@@ -795,7 +813,6 @@ class HarnessCapabilityInvoker:
                         "type": "workspace_file",
                         "task_frame_id": self.task_frame_id,
                         "path": path,
-                        "sandbox_path": _sandbox_path(path),
                         "sha256": digest,
                         "size": opened.size,
                         "display_name": display_name,
@@ -852,7 +869,6 @@ class HarnessCapabilityInvoker:
                 "package": _skill_package_preview(skill),
                 "package_workspace": {
                     "relative_path": package_relative_path,
-                    "sandbox_path": _sandbox_path(package_relative_path),
                     "entrypoint": package.entrypoint,
                 },
                 "notice": (
@@ -1050,14 +1066,12 @@ class HarnessCapabilityInvoker:
                 )
                 file_part.pop("bytes", None)
                 file_part["path"] = relative
-                file_part["sandbox_path"] = _sandbox_path(relative)
                 file_part["sha256"] = sha256
                 published.append(
                     {
                         "type": "workspace_file",
                         "task_frame_id": self.task_frame_id,
                         "path": relative,
-                        "sandbox_path": _sandbox_path(relative),
                         "sha256": sha256,
                         "size": len(content),
                         "display_name": requested_name or filename,
@@ -1105,12 +1119,7 @@ class HarnessCapabilityInvoker:
         relative_path = str(stored_data.get("path") or "").strip()
         reference = {
             "kind": _SANDBOX_JSON_FILE_KIND,
-            "sandbox_path": _sandbox_path(relative_path),
-            # ``/workspace`` is a stable path for typed file tools and for
-            # Bubblewrap.  SRT, however, enforces access controls on the host
-            # workspace instead of mounting that alias.  A temporary script
-            # written by the agent therefore needs this task-relative path.
-            "command_path": relative_path,
+            "path": relative_path,
             "size": stored_data.get("size"),
             "sha256": stored_data.get("sha256"),
         }
@@ -1238,14 +1247,19 @@ class HarnessCapabilityInvoker:
         }
 
     def _read_json_tool_result_reference(self, reference: dict[str, Any]) -> Any:
-        sandbox_path = str(reference.get("sandbox_path") or "").strip()
+        raw_path = str(
+            reference.get("path")
+            or reference.get("command_path")
+            or reference.get("sandbox_path")
+            or ""
+        ).strip()
         prefix = f"{SANDBOX_WORKSPACE}/"
-        if not sandbox_path.startswith(prefix):
+        relative_path = raw_path.removeprefix(prefix)
+        if not relative_path:
             raise HarnessExecutionError(
                 "INVALID_TOOL_RESULT_REFERENCE",
-                "JSON 结果引用必须使用当前 TaskFrame 的 /workspace 沙箱路径。",
+                "JSON 结果引用缺少当前 TaskFrame 相对路径。",
             )
-        relative_path = sandbox_path[len(prefix) :]
         expected_prefix = f"{_INTERNAL_TOOL_RESULT_DIRECTORY}/"
         if (
             not relative_path.startswith(expected_prefix)
@@ -1495,17 +1509,6 @@ def _audit_result(result: dict[str, Any]) -> dict[str, Any]:
     return audited
 
 
-def _sandbox_path(relative_path: str) -> str:
-    normalized = str(relative_path or "").strip().replace("\\", "/")
-    if normalized == SANDBOX_WORKSPACE or normalized.startswith(
-        f"{SANDBOX_WORKSPACE}/"
-    ):
-        return normalized
-    if normalized in {"", "."}:
-        return SANDBOX_WORKSPACE
-    return f"{SANDBOX_WORKSPACE}/{normalized.lstrip('/')}"
-
-
 def _safe_artifact_name(value: str) -> str:
     cleaned = "".join(
         character if character.isalnum() or character in {"-", "_", "."} else "-"
@@ -1514,18 +1517,38 @@ def _safe_artifact_name(value: str) -> str:
     return cleaned[:180] or "artifact"
 
 
-def _model_visible_file_result(value: Any, *, key: str = "") -> Any:
-    path_keys = {"path", "source_path", "destination_path", "cwd"}
-    if isinstance(value, dict):
-        return {
-            item_key: _model_visible_file_result(item_value, key=str(item_key))
-            for item_key, item_value in value.items()
-        }
-    if isinstance(value, list):
-        return [_model_visible_file_result(item, key=key) for item in value]
-    if isinstance(value, str) and key in path_keys:
-        return _sandbox_path(value)
-    return value
+def _workspace_changes(
+    workspace_root: Path,
+    before: dict[str, tuple[int, int, int, int]],
+    *,
+    max_changes: int = 20,
+) -> tuple[list[dict[str, Any]] | None, bool]:
+    """Describe bounded command writes without exposing host paths."""
+
+    try:
+        after = snapshot_harness_workspace(workspace_root)
+    except (HarnessArtifactAccessError, OSError):
+        return None, False
+    changes: list[dict[str, Any]] = []
+    truncated = False
+    for path in sorted(after):
+        if not path.startswith(("work/", "output/")) or is_noise_artifact_path(path):
+            continue
+        previous = before.get(path)
+        current = after[path]
+        if previous == current:
+            continue
+        if len(changes) >= max_changes:
+            truncated = True
+            break
+        changes.append(
+            {
+                "path": path,
+                "change": "created" if previous is None else "modified",
+                "size": current[2],
+            }
+        )
+    return changes, truncated
 
 
 def _is_task_output_path(path: str) -> bool:

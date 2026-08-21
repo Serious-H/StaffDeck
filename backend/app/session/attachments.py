@@ -77,17 +77,18 @@ def attachment_context_lines(attachments: Iterable[ChatAttachmentRead | dict[str
         return lines
     lines.append("上传附件上下文：")
     lines.append(
-        "调用 typed 文件工具时使用 /workspace/... 文件工具路径；调用 exec_command 处理上传 "
-        "附件时优先使用 attachments/... 工作区相对路径。用户明确提供的其他绝对路径可以 "
-        "原样使用，但不要猜测或推导宿主机路径。"
+        "文件工具、exec_command 和临时脚本统一使用当前 TaskFrame 相对路径；"
+        "不要猜测或推导宿主机路径。"
     )
     for index, attachment in enumerate(normalized, start=1):
         sandbox_path = attachment.sandbox_path or sandbox_attachment_path(attachment, index)
         relative_path = sandbox_path.removeprefix("/workspace/")
+        if not relative_path.startswith("input/"):
+            relative_path = f"input/{relative_path.lstrip('/')}"
         lines.append(
             f"{index}. 文件名：{attachment.filename}；类型：{attachment.kind}/{attachment.content_type}；"
             f"大小：{attachment.size} bytes；"
-            f"exec_command 相对路径：{relative_path}；typed 文件工具路径：{sandbox_path}"
+            f"路径：{relative_path}"
         )
         if attachment.kind == "image":
             lines.append("图片同时作为本轮视觉输入提供；若模型不支持视觉输入，请读取沙箱文件。")

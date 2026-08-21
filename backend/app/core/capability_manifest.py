@@ -29,7 +29,11 @@ from app.db.models import (
     Tool,
     UIConfig,
 )
-from app.harness import build_file_tool_registry, register_command_tools
+from app.harness import (
+    build_file_tool_registry,
+    register_command_tools,
+    register_time_tools,
+)
 from app.harness.sandbox import available_backend
 
 RESERVED_HARNESS_CAPABILITY_NAMES = {
@@ -38,6 +42,7 @@ RESERVED_HARNESS_CAPABILITY_NAMES = {
     "exec_command",
     "knowledge_search",
     "workspace_file_materialize",
+    "current_datetime",
 }
 
 
@@ -70,19 +75,24 @@ class CapabilityManifestBuilder:
 
         builtin_registry = build_file_tool_registry()
         register_command_tools(builtin_registry)
+        register_time_tools(builtin_registry)
         for spec in builtin_registry.specs():
             is_command = spec.name == "exec_command"
+            is_time = spec.name == "current_datetime"
+            provider = "builtin.fs"
+            if is_command:
+                provider = "builtin.command"
+            elif is_time:
+                provider = "builtin.time"
             available.append(
                 CapabilityDescriptor(
-                    capability_id=(
-                        f"builtin.command.{spec.name}" if is_command else f"builtin.fs.{spec.name}"
-                    ),
+                    capability_id=f"{provider}.{spec.name}",
                     name=spec.name,
                     kind="file",
                     description=spec.description,
                     input_schema=dict(spec.input_schema),
                     metadata={
-                        "provider": ("builtin.command" if is_command else "builtin.fs"),
+                        "provider": provider,
                         "side_effect": spec.side_effect,
                         **(
                             {

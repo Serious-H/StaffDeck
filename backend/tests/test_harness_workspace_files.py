@@ -175,7 +175,7 @@ def test_session_file_ref_is_available_to_a_later_taskframe(
     assert later_refs == [file_ref]
     assert manifest == [file_ref]
     assert file_ref.model_payload()["visibility"] == "session"
-    assert materialized.model_payload()["sandbox_path"].startswith("/workspace/input/session/")
+    assert materialized.model_payload()["path"].startswith("input/session/")
     assert (consumer_workspace / materialized.relative_path).read_text(encoding="utf-8") == (
         "# 初版报告\n"
     )
