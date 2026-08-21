@@ -1913,7 +1913,14 @@ def test_large_external_json_result_uses_sandbox_reference_and_auto_resolves(
     assert reference["sandbox_path"] == (
         "/workspace/.harness/tool-results/hcall-large.json"
     )
-    assert set(reference) == {"kind", "sandbox_path", "size", "sha256"}
+    assert reference["command_path"] == ".harness/tool-results/hcall-large.json"
+    assert set(reference) == {
+        "kind",
+        "sandbox_path",
+        "command_path",
+        "size",
+        "sha256",
+    }
     assert json.loads(read_result["data"]["content"]) == large_data
     assert small_result["data"] == {"ok": True}
     assert sink_result["data"] == {"accepted": True}
@@ -2746,9 +2753,10 @@ def test_harness_agent_enforces_tool_allowlist_and_keeps_an_isolated_transcript(
     assert "GeneralSkill 是工作流说明包" in system_prompts[0]
     assert "不会启动第二套 runner" in system_prompts[0]
     assert "Skill 负责提供工作流程" in system_prompts[0]
-    assert "最终文件必须明确写到 `/workspace/output/<文件名>`" in system_prompts[0]
-    assert "不得根据当前目录、`os.getcwd()` 或宿主机路径推导" in system_prompts[0]
-    assert "`sandbox_path` 直接作为 `exec_command` 中脚本的" in system_prompts[0]
+    assert "最终文件必须\n  明确写到 `output/<文件名>`" in system_prompts[0]
+    assert "`command_path` 是供临时脚本和" in system_prompts[0]
+    assert "不得\n  根据 `os.getcwd()`、宿主机路径或父目录推导" in system_prompts[0]
+    assert "不要在脚本中\n  使用 `sandbox_path`" in system_prompts[0]
     assert "不得对其调用 `copy_file`、" in system_prompts[0]
 
 

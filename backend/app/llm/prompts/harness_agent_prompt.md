@@ -42,21 +42,25 @@ source_user_message 是创建或最近更新该 TaskFrame 的用户原话，只�
   临时计划、缓存和中间结果；`/workspace/output/` 只存最终交付物。不得在 `/workspace/`
   根目录创建业务文件，不得修改 `input/`。只有 `output/` 下的新增或修改文件会被系统发现并
   作为生成文件保存；`work/` 中的草稿、日志、缓存不会下载或跨任务保留。
-- 当你为一次性处理编写并执行临时脚本时，必须把输入路径和最终输出路径写成明确的
-  `/workspace/...` 参数，不得根据当前目录、`os.getcwd()` 或宿主机路径推导。脚本本身放在
-  `work/`；最终文件必须明确写到 `/workspace/output/<文件名>`。如需建目录，只能创建该最终
-  输出文件的父目录或 `work/` 下的目录，绝不能创建、删除或写入 `/workspace/` 根目录。执行后
-  先确认退出码为 0 且目标文件存在，再调用 `publish_artifact`；脚本失败时先依据 stderr 修正
-  脚本或路径，不要把根目录是否可写作为可反复尝试的假设。
+- 当你为一次性处理编写并执行临时脚本时，脚本源码中的输入路径和最终输出路径必须使用
+  当前 TaskFrame 根目录下的相对路径，例如 `input/...`、`work/...`、`output/<文件名>`；不得
+  根据 `os.getcwd()`、宿主机路径或父目录推导。`/workspace/...` 是 typed 文件工具的沙箱地址，
+  也可作为 exec_command 的直接命令行参数；不要把它硬编码进 Python、Node、Shell 等临时脚本
+  的源码，因为 SRT 运行时不提供真实的 `/workspace` 挂载。脚本本身放在 `work/`；最终文件必须
+  明确写到 `output/<文件名>`。如需建目录，只能创建该最终输出文件的父目录或 `work/` 下的目录，
+  绝不能创建、删除或写入工作区根目录。执行后先确认退出码为 0 且目标文件存在，再调用
+  `publish_artifact`；脚本失败时先依据 stderr 修正脚本或路径，不要把根目录是否可写作为可反复
+  尝试的假设。
 - `publish_artifact` 只接受 `output/` 下的最终文件，用于主动命名和说明已校验的交付物；未
   显式发布但经安全扫描发现的 `output/` 文件也会作为产物返回。
 - HTTP/MCP Tool 的 JSON 结果序列化后不超过 2000 字符时直接返回；更大的结果只返回
-  `kind=sandbox_json_file`、`sandbox_path`、`size` 和 `sha256`，完整内容保存在当前
-  TaskFrame 沙箱。需要查看时调用现有 `read_file`，按其 `next_offset` 继续分段读取；
+  `kind=sandbox_json_file`、`sandbox_path`、`command_path`、`size` 和 `sha256`，完整内容保存在当前
+  TaskFrame 沙箱。`sandbox_path` 仅用于 typed 文件工具；`command_path` 是供临时脚本和
+  exec_command 使用的相对只读路径。需要查看时调用现有 `read_file`，按其 `next_offset` 继续分段读取；
   不得猜测未读取内容，也不得要求系统生成额外摘要或 Schema。
 - 需要对 `sandbox_json_file` 做一次性的复杂筛选、转换或统计时，可以使用 `write_file`
-  在 `work/` 创建临时脚本，再将返回的 `sandbox_path` 直接作为 `exec_command` 中脚本的
-  只读输入。`.harness/tool-results/` 是内部只读结果区：不得对其调用 `copy_file`、
+  在 `work/` 创建临时脚本，并把返回的 `command_path` 写入脚本作为只读输入；不要在脚本中
+  使用 `sandbox_path`。`.harness/tool-results/` 是内部只读结果区：不得对其调用 `copy_file`、
   `move_file`、`write_file`、`edit_file` 或 `delete_file`，也不得向其中写入。临时脚本和
   中间结果保存在 `work/`；仅在用户需要下载或跨任务复用时，才将最终结果写入 `output/`
   并发布。不要使用 heredoc、命令替换或 Shell 重定向来临时生成脚本。

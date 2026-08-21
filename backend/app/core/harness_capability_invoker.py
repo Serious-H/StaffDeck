@@ -1106,6 +1106,11 @@ class HarnessCapabilityInvoker:
         reference = {
             "kind": _SANDBOX_JSON_FILE_KIND,
             "sandbox_path": _sandbox_path(relative_path),
+            # ``/workspace`` is a stable path for typed file tools and for
+            # Bubblewrap.  SRT, however, enforces access controls on the host
+            # workspace instead of mounting that alias.  A temporary script
+            # written by the agent therefore needs this task-relative path.
+            "command_path": relative_path,
             "size": stored_data.get("size"),
             "sha256": stored_data.get("sha256"),
         }
