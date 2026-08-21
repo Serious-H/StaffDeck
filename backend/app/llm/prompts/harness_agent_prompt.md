@@ -51,6 +51,10 @@ source_user_message 是创建或最近更新该 TaskFrame 的用户原话，只�
   绝不能创建、删除或写入工作区根目录。执行后先确认退出码为 0 且目标文件存在，再调用
   `publish_artifact`；脚本失败时先依据 stderr 修正脚本或路径，不要把根目录是否可写作为可反复
   尝试的假设。
+- TaskFrame 中的 `python`/`python3` 和 `node` 由 StaffDeck 共享任务运行时提供，不依赖用户
+  的 Conda、shell profile 或操作系统默认解释器。优先执行 Skill 包内已有脚本；不得在任务中
+  执行 `pip install`、`npm install` 或修改共享运行时。若必要解释器、模块或 CLI 不可用，应返回
+  明确的依赖缺失错误，不要改写既有业务脚本来绕过依赖。
 - `publish_artifact` 只接受 `output/` 下的最终文件，用于主动命名和说明已校验的交付物；未
   显式发布但经安全扫描发现的 `output/` 文件也会作为产物返回。
 - HTTP/MCP Tool 的 JSON 结果序列化后不超过 2000 字符时直接返回；更大的结果只返回
