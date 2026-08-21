@@ -95,11 +95,16 @@ import type {
 const GENERAL_SKILL_PAGE_SIZE = 10;
 const GENERAL_SKILL_RUN_MODEL_STORAGE_KEY = 'general-skill-run-model';
 
-const STATUS_BADGE: Record<GeneralSkillRead['status'], { tone: BadgeTone; text: string }> = {
-  draft: { tone: 'blue', text: '草稿' },
+type GeneralSkillDisplayStatus = 'published' | 'archived';
+
+const STATUS_BADGE: Record<GeneralSkillDisplayStatus, { tone: BadgeTone; text: string }> = {
   published: { tone: 'green', text: '已启用' },
   archived: { tone: 'gray', text: '已停用' },
 };
+
+function generalSkillDisplayStatus(status: GeneralSkillRead['status']): GeneralSkillDisplayStatus {
+  return status === 'published' ? 'published' : 'archived';
+}
 
 const EMPTY_SKILL_MARKDOWN = `# 技能说明
 
@@ -355,7 +360,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const [rows, setRows] = useState<GeneralSkillRead[]>([]);
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState('');
-  const [statusFilter, setStatusFilter] = useState<'all' | GeneralSkillRead['status']>('all');
+  const [statusFilter, setStatusFilter] = useState<'all' | GeneralSkillDisplayStatus>('all');
   const [agentId, setAgentId] = useState(readEmployeeScope);
   const [isOverallAgent, setIsOverallAgent] = useState(true);
   const [agents, setAgents] = useState<AgentProfileRead[]>([]);
@@ -440,7 +445,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const filteredRows = useMemo(() => {
     const keyword = searchText.trim().toLowerCase();
     return rows.filter((row) => {
-      const matchesStatus = statusFilter === 'all' || row.status === statusFilter;
+      const matchesStatus = statusFilter === 'all' || generalSkillDisplayStatus(row.status) === statusFilter;
       const haystack = [
         row.name,
         row.slug,
@@ -457,8 +462,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   const stats = useMemo(() => ({
     total: rows.length,
     published: rows.filter((row) => row.status === 'published').length,
-    draft: rows.filter((row) => row.status === 'draft').length,
-    archived: rows.filter((row) => row.status === 'archived').length,
+    archived: rows.filter((row) => generalSkillDisplayStatus(row.status) === 'archived').length,
   }), [rows]);
 
   async function setSkillPublished(row: GeneralSkillRead, published: boolean) {
@@ -759,7 +763,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
       title: '状态',
       width: 100,
       render: (row) => {
-        const preset = STATUS_BADGE[row.status] || { tone: 'gray' as BadgeTone, text: row.status };
+        const preset = STATUS_BADGE[generalSkillDisplayStatus(row.status)];
         return <StatusBadge tone={preset.tone}>{preset.text}</StatusBadge>;
       },
     },
@@ -779,7 +783,7 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
   ];
 
   const renderMobileCard = (row: GeneralSkillRead) => {
-    const preset = STATUS_BADGE[row.status] || { tone: 'gray' as BadgeTone, text: row.status };
+    const preset = STATUS_BADGE[generalSkillDisplayStatus(row.status)];
     return (
       <article className={MOBILE_CARD_CLASS} key={row.id}>
         <div className="flex min-w-0 items-start justify-between gap-[10px]">
@@ -864,7 +868,6 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
         <div className="flex flex-wrap items-stretch gap-[20px]" aria-label="技能统计">
           <StatCard label="技能总数" value={stats.total} />
           <StatCard label="已启用" value={stats.published} tone="green" />
-          <StatCard label="草稿" value={stats.draft} />
           <StatCard label="已停用" value={stats.archived} />
         </div>
 
@@ -898,14 +901,13 @@ export default function GeneralSkillsPage({ embedded = false, currentUser, onLog
                 </button>
               )}
             </label>
-            <UISelect value={statusFilter} onValueChange={(value) => setStatusFilter(value as 'all' | GeneralSkillRead['status'])}>
+            <UISelect value={statusFilter} onValueChange={(value) => setStatusFilter(value as 'all' | GeneralSkillDisplayStatus)}>
               <SelectTrigger className={cn(SELECT_TRIGGER_CLASS, 'w-[130px]')} aria-label="状态筛选">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="all">全部状态</SelectItem>
                 <SelectItem value="published">已启用</SelectItem>
-                <SelectItem value="draft">草稿</SelectItem>
                 <SelectItem value="archived">已停用</SelectItem>
               </SelectContent>
             </UISelect>
@@ -1478,7 +1480,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   const [skillSlug, setSkillSlug] = useState('');
   const [skillDescription, setSkillDescription] = useState('');
   const [skillHomepage, setSkillHomepage] = useState('');
-  const [skillStatus, setSkillStatus] = useState<GeneralSkillRead['status']>('draft');
+  const [skillStatus, setSkillStatus] = useState<GeneralSkillRead['status']>('published');
   const [capabilityScope, setCapabilityScope] = useState<CapabilityScope>('general');
   const [skillFiles, setSkillFiles] = useState<GeneralSkillFile[]>([
     { path: 'SKILL.md', content: EMPTY_SKILL_MARKDOWN, size: EMPTY_SKILL_MARKDOWN.length, mime_type: 'text/markdown' },
@@ -1711,6 +1713,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     }
     setSaving(true);
     try {
+      const savedStatus = editingSlug && skillStatus === 'archived' ? 'archived' : 'published';
       const row = await api.post<GeneralSkillRead>('/api/enterprise/general-skills/import', {
         tenant_id: TENANT_ID,
         agent_id: !isOverallAgent && agentId ? agentId : undefined,
@@ -1722,10 +1725,10 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         markdown,
         files: skillFiles.length ? skillFiles : [{ path: 'SKILL.md', content: markdown }],
         directories: skillDirectories,
-        status: skillStatus,
+        status: savedStatus,
         original_slug: editingSlug || undefined,
       });
-      notify.success(editingSlug ? `已保存 ${row.name}` : `已保存草稿 ${row.name}`);
+      notify.success(editingSlug ? `已保存 ${row.name}` : `已保存并启用 ${row.name}`);
       setSelectedSlug(row.slug);
       setEditingSlug(row.slug);
       setMarkdown(row.skill_markdown);
@@ -1765,7 +1768,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     setSkillSlug('');
     setSkillDescription('');
     setSkillHomepage('');
-    setSkillStatus('draft');
+    setSkillStatus('published');
     setCapabilityScope('general');
     setSkillFiles([{ path: 'SKILL.md', content: EMPTY_SKILL_MARKDOWN, size: EMPTY_SKILL_MARKDOWN.length, mime_type: 'text/markdown' }]);
     setSkillDirectories([]);
@@ -1865,7 +1868,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
     }
   }
 
-  function startImportedDraft() {
+  function startImportedSkill() {
     setEditingSlug(null);
     setSelectedSlug(undefined);
     setRunResult(null);
@@ -2047,14 +2050,14 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       if (controller.signal.aborted) return;
       const updatingExisting = Boolean(editingSlug && preview.slug === editingSlug);
       if (!updatingExisting) {
-        startImportedDraft();
+        startImportedSkill();
       }
       setSkillName(preview.name);
       setSkillSlug(preview.slug);
       setSkillDescription(preview.description || '');
       setSkillHomepage(preview.homepage || '');
       if (!updatingExisting) {
-        setSkillStatus('draft');
+        setSkillStatus('published');
       }
       setMarkdown(preview.skill_markdown);
       setSkillFiles(preview.skill_files);
@@ -2065,7 +2068,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       notify.success(
         updatingExisting
           ? `已载入 ${preview.filename}；保存后将更新技能「${editingSlug}」。`
-          : `已解析 ${preview.filename}；请确认名称、技能标识和文件内容后保存草稿。`,
+          : `已解析 ${preview.filename}；请确认名称、技能标识和文件内容后保存并启用。`,
       );
     } catch (error) {
       if (isAbortError(error)) {
@@ -2429,7 +2432,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
   async function importSingleFile(target: File) {
     const text = await target.text();
     const nextFile = { path: 'SKILL.md', content: text, size: target.size, mime_type: target.type || 'text/markdown' };
-    startImportedDraft();
+    startImportedSkill();
     setSkillFiles([nextFile]);
     setSkillDirectories([]);
     setSelectedFilePath('SKILL.md');
@@ -2462,7 +2465,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
       return;
     }
     nextFiles.sort((a, b) => a.path.localeCompare(b.path));
-    startImportedDraft();
+    startImportedSkill();
     setSkillFiles(nextFiles);
     setSkillDirectories([]);
     setMarkdownPreviewOpen(false);
@@ -2602,7 +2605,7 @@ function GeneralSkillEditorPage({ mode, currentUser, onLogout }: { mode: 'new' |
         {importMenu}
         {canManageCurrentScope && (
           <UIButton disabled={saving} className={PRIMARY_BUTTON_CLASS} onClick={() => void importSkill()}>
-            {editingSlug ? '保存' : '保存草稿'}
+            {editingSlug ? '保存' : '保存并启用'}
           </UIButton>
         )}
       </div>
